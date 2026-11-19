@@ -326,6 +326,55 @@ function withSourceRange<T extends HTMLElement>(el: T, from: number, to: number)
   return el
 }
 
+/**
+ * 图片灯箱。
+ *
+ * 编辑器里的图片被控制在阅读列宽之内（只缩不放，见 editor-preview.css），
+ * 于是 CAD 截图、架构图缩到一千多像素之后，图里的标注就糊成一片。点一下看原图，
+ * 是「只缩不放」缺的那另一半。
+ *
+ * 这一层挂在 body 上而不是编辑器 DOM 里：它要盖住整个窗口，也不该跟着文档滚动。
+ * 第一次点击时才创建，之后复用同一个节点——每张图各建一个的话，一篇几十张图的文档
+ * 光是不可见的 DOM 就够呛。
+ */
+let imageOverlay: HTMLDivElement | null = null
+
+/** 右键菜单里的「查看原图」从这里进来（主进程那侧只能发一个 src 回来）。 */
+export function openImageOverlay(src: string, alt = ''): void {
+  showImageOverlay(src, alt)
+}
+
+function showImageOverlay(src: string, alt: string): void {
+  if (!imageOverlay) {
+    const box = document.createElement('div')
+    box.className = 'cm-image-overlay'
+    box.setAttribute('role', 'dialog')
+    box.setAttribute('aria-modal', 'true')
+    const img = document.createElement('img')
+    const caption = document.createElement('div')
+    caption.className = 'cm-image-overlay-caption'
+    box.append(img, caption)
+    // 整个遮罩都是关闭热区：这层里除了图没有别的东西可点。
+    box.addEventListener('click', () => box.classList.remove('open'))
+    imageOverlay = box
+    document.body.appendChild(box)
+    // Esc 关闭。用捕获阶段，免得被编辑器自己的 keymap 先吃掉。
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !imageOverlay?.classList.contains('open')) return
+      imageOverlay.classList.remove('open')
+      event.preventDefault()
+      event.stopPropagation()
+    }, true)
+  }
+  const img = imageOverlay.querySelector('img') as HTMLImageElement
+  const caption = imageOverlay.querySelector('.cm-image-overlay-caption') as HTMLElement
+  img.src = src
+  img.alt = alt
+  caption.textContent = alt
+  caption.hidden = alt.trim() === ''
+  imageOverlay.classList.add('open')
+}
+
 class ImageWidget extends WidgetType {
   constructor(
     readonly src: string,
@@ -348,6 +397,14 @@ class ImageWidget extends WidgetType {
     const img = document.createElement('img')
     img.src = this.src
     img.alt = this.alt
+    img.title = this.alt.trim() === '' ? '点击查看原图' : `${this.alt}（点击查看原图）`
+    // 点图看原图。拦掉冒泡，否则 CodeMirror 会把光标挪到图片这个替换区间上，
+    // 下一次按键就可能改到图片源码。改图请走源码模式（⌘/）。
+    img.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      showImageOverlay(this.src, this.alt)
+    })
     img.addEventListener('load', () => {
       remeasureAfterDraw()
     })
@@ -357,6 +414,13 @@ class ImageWidget extends WidgetType {
       remeasureAfterDraw()
     })
     wrap.appendChild(img)
+    // 图注取 alt：工程图、架构图的 alt 通常就是图名，白放着可惜。
+    if (this.alt.trim() !== '') {
+      const caption = document.createElement('span')
+      caption.className = 'cm-md-image-caption'
+      caption.textContent = this.alt
+      wrap.appendChild(caption)
+    }
     return wrap
   }
 }
@@ -375,6 +439,33 @@ export const cleanExportField = StateField.define<boolean>({
 
 function exportingCleanly(state: EditorState): boolean {
   return state.field(cleanExportField, false) ?? false
+}
+
+/**
+ * 阅读模式。
+ *
+ * 它只改一件事：块级 widget（表格、图、HTML 块、块公式）不再因为光标落进去而退回源码。
+ * 编辑器的可编辑性由 core.ts 的 editableCompartment 关掉，这一层只负责「画」。
+ *
+ * 为什么要它：表格是整块替换成渲染结果的，光标一进块就把源码露出来，这是编辑态该有的
+ * 行为（不然改不了表）；但纯阅读时它反而是干扰——鼠标点一下表格，一张排好的表就变成
+ * 一堆竖线管道符。阅读模式把这个退回关掉。
+ */
+export const setReadingMode = StateEffect.define<boolean>()
+
+export const readingModeField = StateField.define<boolean>({
+  create: () => false,
+  update(value, tr) {
+    for (const effect of tr.effects) {
+      if (effect.is(setReadingMode)) return effect.value
+    }
+    return value
+  },
+})
+
+/** 当前是不是阅读模式。没装这个 field 时（导出快照、验收脚本）一律当编辑态。 */
+function readingMode(state: EditorState): boolean {
+  return state.field(readingModeField, false) ?? false
 }
 
 /**
@@ -409,6 +500,8 @@ function isActiveRange(_state: EditorState, _from: number, _to: number): boolean
  * 两端都算在内：点表格落在源码第一行开头，那是块的起点，也算「在里面」。
  */
 function isBlockActive(state: EditorState, from: number, to: number): boolean {
+  // 阅读模式下一律不认：块级 widget 保持渲染结果，点它也不会退回源码。
+  if (readingMode(state)) return false
   const sel = state.selection.main
   return sel.from >= from && sel.to <= to
 }
@@ -875,22 +968,38 @@ function appendCellText(parent: HTMLElement, text: string, math: MathRange[], fr
   if (cursor < to) parent.appendChild(document.createTextNode(text.slice(cursor, to)))
 }
 
-function appendInline(parent: HTMLElement, text: string, base: string | null): void {
+function appendInline(
+  parent: HTMLElement,
+  text: string,
+  base: string | null,
+  span?: { from: number; to: number },
+): void {
   // 公式先定出来，免得公式里的 `*`、`_` 被当成强调吃掉
   const math = scanMath(text, codeSpanRanges(text))
   const write = (target: HTMLElement, from: number, to: number): void =>
     appendCellText(target, text, math, from, to)
 
-  INLINE_RE.lastIndex = 0
-  let last = 0
+  // 强调、删除线、链接文字里还可能套着行内代码或另一层强调——真图里最常见的写法
+  // 就是 **`钢梁 v4` / `钢柱 v4`** 这种（2026-11-17 报的「表格里还是原文」）。
+  // 所以这里要能只解析一段区间，并且递归调用自己。
+  // 正则用局部实例：递归会动 lastIndex，共用模块级那一个会让外层从错误位置继续。
+  const re = new RegExp(INLINE_RE.source, INLINE_RE.flags)
+  const start = span?.from ?? 0
+  const stop = span?.to ?? text.length
+  re.lastIndex = start
+  let last = start
   let match: RegExpExecArray | null
-  while ((match = INLINE_RE.exec(text)) !== null) {
+  while ((match = re.exec(text)) !== null) {
+    // 递归时只认落在这一段里的匹配，跨出边界的留给外层那一圈处理
+    if (match.index >= stop) break
+    const end = match.index + match[0].length
+    if (end > stop) break
     // 落在公式里的标记只是公式的一部分：`$a*b*c$` 里的 `*b*` 不是斜体。
     // 跳过它，把整段留到最后按公式画。
     const index = match.index
     const inside = math.find((range) => range.from <= index && index < range.to)
     if (inside) {
-      INLINE_RE.lastIndex = inside.to
+      re.lastIndex = inside.to
       continue
     }
     if (match.index > last) write(parent, last, match.index)
@@ -899,12 +1008,12 @@ function appendInline(parent: HTMLElement, text: string, base: string | null): v
     if (g.strong !== undefined || g.strongU !== undefined) {
       const el = document.createElement('strong')
       const [from, to] = at.strong ?? at.strongU ?? [0, 0]
-      write(el, from, to)
+      appendInline(el, text, base, { from, to })
       parent.appendChild(el)
     } else if (g.em !== undefined || g.emU !== undefined) {
       const el = document.createElement('em')
       const [from, to] = at.em ?? at.emU ?? [0, 0]
-      write(el, from, to)
+      appendInline(el, text, base, { from, to })
       parent.appendChild(el)
     } else if (g.code !== undefined) {
       const el = document.createElement('code')
@@ -913,7 +1022,7 @@ function appendInline(parent: HTMLElement, text: string, base: string | null): v
     } else if (g.strike !== undefined) {
       const el = document.createElement('s')
       const [from, to] = at.strike ?? [0, 0]
-      write(el, from, to)
+      appendInline(el, text, base, { from, to })
       parent.appendChild(el)
     } else if (g.alt !== undefined) {
       const img = document.createElement('img')
@@ -924,7 +1033,7 @@ function appendInline(parent: HTMLElement, text: string, base: string | null): v
       const el = document.createElement('a')
       const [from, to] = at.linkText ?? [0, 0]
       // 空文字的空链接仍然把地址顶上来，否则格子里什么都看不见
-      if (to > from) write(el, from, to)
+      if (to > from) appendInline(el, text, base, { from, to })
       else el.textContent = g.href ?? ''
       const href = (g.href ?? '').trim()
       if (/^https?:\/\//i.test(href)) el.setAttribute('href', href)
@@ -932,9 +1041,9 @@ function appendInline(parent: HTMLElement, text: string, base: string | null): v
     } else if (/^<br/i.test(match[0])) {
       parent.appendChild(document.createElement('br'))
     }
-    last = match.index + match[0].length
+    last = end
   }
-  if (last < text.length) write(parent, last, text.length)
+  if (last < stop) write(parent, last, stop)
 }
 
 function collectTables(
@@ -1607,6 +1716,7 @@ const parseRefresh = ViewPlugin.fromClass(class {
 export const livePreview: Extension = [
   editorFocusField,
   cleanExportField,
+  readingModeField,
   documentFileUrlField,
   livePreviewField,
   parseRefresh,

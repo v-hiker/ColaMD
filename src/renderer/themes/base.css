@@ -446,6 +446,13 @@ body.platform-win #titlebar {
   display: none;
 }
 
+/* 阅读模式的唯一例外：标题栏按钮平时不点亮（理由见上面那条注释），但阅读模式改的是
+   整篇的可编辑性，界面上没有别的痕迹能说明「现在点哪儿都改不动」，所以这颗图标用主题的
+   链接色自报状态。只换颜色，不加底色块——一块底色就会把视线往标题栏拽。 */
+#titlebar > #reading-mode-btn.active {
+  color: var(--link-color);
+}
+
 /* The Windows menu button is the row's first child, so it gets its own air
    instead of the 8px gap the right-hand cluster uses: the row's 6px gutter is
    its left margin, and 6px on the right puts the glyph exactly halfway between

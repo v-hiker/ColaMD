@@ -439,16 +439,38 @@
  * 图片按文件里写的位置就地画出来。地址在画图那一刻按文档自己的 file:// URL 解析，
  * 文件里那串相对路径一个字符都不改（改了就等于保存时动用户的文件）。
  */
+/* 图注在图片下方，所以这一层改成竖排的 inline-flex，仍然占行内位置。
+ * 不能用 display:block：它会让 CodeMirror 的行高测量把这一行当成块级内容，
+ * 点正文时光标会落错行（表格 widget 那边踩过同一个坑）。 */
 .cm-content .cm-md-image {
-  display: inline-block;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
   max-width: 100%;
+  vertical-align: bottom;
 }
 
+/* max-height 是给超高长图用的：没有它，一张 1000x3600 的 CAD 全图会占掉三四屏，
+ * 中间什么都不显示。65vh 让一张图最多占三分之二屏，下面总还能露出下一段；
+ * 想看清细节就点开（见下面的灯箱）。 */
 .cm-content .cm-md-image img {
   max-width: 100%;
+  max-height: 65vh;
+  width: auto;
   height: auto;
+  object-fit: contain;
   border-radius: 4px;
   vertical-align: bottom;
+  cursor: zoom-in;
+}
+
+.cm-content .cm-md-image-caption {
+  margin-top: 5px;
+  font-size: 0.85em;
+  line-height: 1.5;
+  color: var(--text-muted);
+  text-align: center;
+  max-width: 100%;
 }
 
 /* 加载不出来就把源码放回去：宁可难看，不吞用户的字 */
@@ -556,6 +578,16 @@ body.exporting .cm-content .cm-md-frontmatter {
   .cm-content .cm-md-frontmatter {
     display: none !important;
   }
+}
+
+/* ======= 阅读模式 ======= */
+
+/* 阅读态里光标没有用处：编辑器已经不可编辑，闪着的竖线只会让人以为随手能改。
+ * 选区层留着——阅读时仍要能选中复制。 */
+body.reading-mode .cm-cursor,
+body.reading-mode .cm-cursorLayer,
+body.reading-mode .cm-dropCursor {
+  display: none !important;
 }
 
 /* ======= mermaid ======= */
@@ -739,4 +771,50 @@ body.theme-notion .cm-content .cm-md-url {
 .cm-content .cm-md-frontmatter-folded {
   height: 0;
   line-height: 0;
+}
+
+/* ======= 图片灯箱 ======= */
+
+/* 点图看原图。挂在 body 上（见 live-preview 的 showImageOverlay），所以用固定定位，
+   不参与文档滚动，也不用管编辑器那一层的 z-index。 */
+.cm-image-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(10, 12, 14, 0.86);
+  cursor: zoom-out;
+  -webkit-app-region: no-drag;
+}
+
+.cm-image-overlay.open {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 3vh 3vw;
+  box-sizing: border-box;
+}
+
+.cm-image-overlay img {
+  max-width: 94vw;
+  max-height: 88vh;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 6px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+
+.cm-image-overlay-caption {
+  max-width: 82vw;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.cm-image-overlay-caption[hidden] {
+  display: none;
 }

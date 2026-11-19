@@ -31,6 +31,8 @@ export interface ElectronAPI {
   revealFile: () => Promise<boolean>
   showEntryContextMenu: (path: string, kind: 'file' | 'directory') => Promise<void>
   showTabContextMenu: (payload: { tabId: string; filePath: string | null; canCloseOthers: boolean; canCloseRight: boolean }) => Promise<void>
+  showEditorContextMenu: (payload: { selection: string; link: string | null; image: string | null; canSelectAll: boolean }) => Promise<void>
+  onEditorMenuAction: (callback: (action: string, value: string | null) => void) => void
   onTabMenuAction: (callback: (payload: { action: string; tabId: string }) => void) => void
   listSiblings: () => Promise<SiblingFile[] | null>
   listDirectory: (path: string) => Promise<SiblingFile[] | null>
@@ -83,6 +85,7 @@ export interface ElectronAPI {
   onSiblingsChanged: (callback: (files: SiblingFile[]) => void) => void
   onToggleFilePanel: (callback: () => void) => void
   onToggleSourceMode: (callback: () => void) => void
+  onToggleReadingMode: (callback: () => void) => void
   setEditorFont: (prefs: { family: string; size: number }) => Promise<void>
   listSystemFonts: () => Promise<string[]>
   onEditorFontChanged: (callback: (prefs: { family: string; size: number }) => void) => void
@@ -111,6 +114,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getFileManagerName: () => ipcRenderer.invoke('get-file-manager-name') as Promise<FileManagerName>,
   revealFile: () => ipcRenderer.invoke('reveal-file') as Promise<boolean>,
   showEntryContextMenu: (path: string, kind: 'file' | 'directory') => ipcRenderer.invoke('entry-context-menu', path, kind) as Promise<void>,
+  showEditorContextMenu: (payload: { selection: string; link: string | null; image: string | null; canSelectAll: boolean }) => ipcRenderer.invoke('editor-context-menu', payload) as Promise<void>,
+  onEditorMenuAction: (callback: (action: string, value: string | null) => void) => {
+    ipcRenderer.on('editor-menu-action', (_event, action: string, value: string | null) => callback(action, value))
+  },
   showTabContextMenu: (payload: { tabId: string; filePath: string | null; canCloseOthers: boolean; canCloseRight: boolean }) => ipcRenderer.invoke('tab-context-menu', payload) as Promise<void>,
   onTabMenuAction: (callback: (payload: { action: string; tabId: string }) => void) => {
     ipcRenderer.on('tab-menu-action', (_event, payload: { action: string; tabId: string }) => callback(payload))
@@ -227,6 +234,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onToggleSourceMode: (callback: () => void) => {
     ipcRenderer.on('toggle-source-mode', () => callback())
+  },
+  onToggleReadingMode: (callback: () => void) => {
+    ipcRenderer.on('toggle-reading-mode', () => callback())
   },
   setEditorFont: (prefs: { family: string; size: number }) => {
     return ipcRenderer.invoke('set-editor-font', prefs)

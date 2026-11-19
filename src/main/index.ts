@@ -901,6 +901,46 @@ ipcMain.handle('tab-context-menu', (event, payload: unknown) => {
   Menu.buildFromTemplate(items).popup({ window: win })
 })
 
+// Right-click menu for the document itself. The renderer cannot build a native
+// menu, so it reports what sits under the cursor and this decides the items.
+// Selection is read from window.getSelection() on the renderer side: text inside
+// widgets (tables, images) lives outside CodeMirror's selection model.
+ipcMain.handle('editor-context-menu', (event, payload: unknown) => {
+  const win = getWinFromEvent(event)
+  if (!win || typeof payload !== 'object' || payload === null) return
+  const { selection, link, image, canSelectAll } = payload as Record<string, unknown>
+  const zh = getPreferredLanguage() === 'zh'
+  const text = typeof selection === 'string' ? selection : ''
+  const items: Electron.MenuItemConstructorOptions[] = []
+  if (text.trim() !== '') {
+    items.push({ label: zh ? '复制' : 'Copy', click: () => copyToClipboard(text) })
+  }
+  if (canSelectAll === true) {
+    items.push({
+      label: zh ? '全选' : 'Select All',
+      click: () => win.webContents.send('editor-menu-action', 'select-all', null)
+    })
+  }
+  if (typeof link === 'string' && link !== '') {
+    if (items.length > 0) items.push({ type: 'separator' })
+    items.push({ label: zh ? '复制链接地址' : 'Copy Link Address', click: () => copyToClipboard(link) })
+    items.push({
+      label: zh ? '在浏览器中打开' : 'Open Link in Browser',
+      click: () => { void shell.openExternal(link) }
+    })
+  }
+  if (typeof image === 'string' && image !== '') {
+    if (items.length > 0) items.push({ type: 'separator' })
+    items.push({ label: zh ? '复制图片地址' : 'Copy Image Address', click: () => copyToClipboard(image) })
+    items.push({
+      label: zh ? '查看原图' : 'View Full Image',
+      click: () => win.webContents.send('editor-menu-action', 'open-image', image)
+    })
+  }
+  if (items.length === 0) return
+  Menu.buildFromTemplate(items).popup({ window: win })
+})
+
 // Right-click menu for a file panel entry. Native menu on purpose: no custom
 // popup to theme, keep it accessible and platform familiar.
 ipcMain.handle('entry-context-menu', (event, targetPath: unknown, kind: unknown) => {
@@ -1784,7 +1824,7 @@ function buildMenu(): void {
         recentOpen: '最近打开', restoreOnLaunch: '启动时打开上次文档', clearRecent: '清除最近记录', noRecent: '没有最近打开的文件',
         exportPDF: '导出 PDF...', exportSlidesPDF: '导出幻灯片 PDF...', exportHTML: '导出 HTML...', exportWord: '导出 Word...', exportImageDesktop: '导出图片（电脑阅读）...', exportImageMobile: '导出图片（手机阅读）...', find: '查找',
         setDefault: '设置为默认应用...',
-        filePanel: '显示 / 隐藏文件列表', sourceMode: '切换 Markdown 源码',
+        filePanel: '显示 / 隐藏文件列表', sourceMode: '切换 Markdown 源码', readingMode: '阅读模式（只读）',
         panelSide: '文件列表位置', panelSideLeft: '在左侧', panelSideRight: '在右侧',
         pageWidth: '正文宽度', pageWidthNarrow: '窄', pageWidthStandard: '标准', pageWidthWide: '宽',
         light: '浅色', dark: '深色', elegant: '雅致',
@@ -1806,7 +1846,7 @@ function buildMenu(): void {
         recentOpen: 'Open Recent', restoreOnLaunch: 'Reopen last document at launch', clearRecent: 'Clear Recent', noRecent: 'No recent files',
         exportPDF: 'Export PDF...', exportSlidesPDF: 'Export Slides PDF...', exportHTML: 'Export HTML...', exportWord: 'Export Word...', exportImageDesktop: 'Export Image (Desktop)...', exportImageMobile: 'Export Image (Mobile)...', find: 'Find',
         setDefault: 'Set as Default...',
-        filePanel: 'Show / Hide File List', sourceMode: 'Toggle Markdown Source',
+        filePanel: 'Show / Hide File List', sourceMode: 'Toggle Markdown Source', readingMode: 'Reading Mode (read-only)',
         panelSide: 'File List Position', panelSideLeft: 'On the Left', panelSideRight: 'On the Right',
         pageWidth: 'Text Width', pageWidthNarrow: 'Narrow', pageWidthStandard: 'Standard', pageWidthWide: 'Wide',
         light: 'Light', dark: 'Dark', elegant: 'Elegant',
@@ -2025,6 +2065,12 @@ function buildMenu(): void {
           label: labels.sourceMode,
           accelerator: 'CmdOrCtrl+/',
           click: () => sendToFocused('toggle-source-mode')
+        },
+        {
+          // 只读阅读：锁住输入，表格与图片点一下也不再退回源码
+          label: labels.readingMode,
+          accelerator: 'CmdOrCtrl+Shift+R',
+          click: () => sendToFocused('toggle-reading-mode')
         },
         { type: 'separator' },
         { label: labels.fontSettings, click: () => sendToFocused('open-font-settings') },

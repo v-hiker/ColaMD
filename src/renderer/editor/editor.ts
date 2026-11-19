@@ -16,7 +16,7 @@ import { footnoteDefinitions } from './footnotes'
 import { selectionHTMLFrom } from './clean-html'
 import { renderWholeDocument, restoreViewport } from '../print-layout'
 
-import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, primeDocumentFileUrl } from './live-preview'
+import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, setReadingMode as setReadingModeEffect, openImageOverlay, primeDocumentFileUrl } from './live-preview'
 import { runFormatCommand as runFormat, type FormatCommandId } from './format-commands'
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
@@ -665,6 +665,25 @@ export function focusEditor(): void {
 // （renderer/slideshow.ts）；这是第二道锁，万一有键漏过来，也落不到没人看得见的页面上。
 export function setEditorEditable(editable: boolean): void {
   handle?.setEditable(editable)
+}
+
+// 图片灯箱：右键菜单的「查看原图」走主进程绕一圈回来，需要在这里露一个入口。
+export { openImageOverlay }
+
+/**
+ * 阅读模式：锁住输入 + 块级 widget 不再因为光标落进去而退回源码。
+ *
+ * 两个动作必须一起做。只锁编辑，表格点一下照样变成一排竖线；只改装饰层，
+ * 还能往里打字，那就不叫阅读。
+ *
+ * 退出时把可编辑性交还给调用方（外壳知道当前该不该可编辑，比如幻灯片放映时它自己也是锁着的），
+ * 所以这里只负责恢复成「可编辑」，放映态的锁由 slideshow 自己再关一次。
+ */
+export function setReadingMode(active: boolean): void {
+  const view = handle?.getView()
+  if (!view) return
+  view.dispatch({ effects: setReadingModeEffect.of(active) })
+  handle?.setEditable(!active)
 }
 
 // 多个标签共用一个编辑器实例。编辑器状态带着文档、选区和撤销栈，

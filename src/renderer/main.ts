@@ -1,4 +1,4 @@
-import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
+import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { withDiagramZoomPaused } from './editor/mermaid-bridge'
 import { jumpToSourceLine, sourcePositionTop } from './editor/source-line'
@@ -17,6 +17,9 @@ import './themes/editor-preview.css'
 import './themes/document.css'
 
 let sourceModeActive = false
+// 阅读模式：锁住输入，表格/图片/HTML 块不再因为光标落进去而退回源码。
+// 与源码模式互斥，进入阅读时会先退出源码。
+let readingModeActive = false
 const editorEl = () => document.getElementById('editor') as HTMLElement
 // 正文的滚动在 .cm-scroller 上，不在 #editor 上；见 editor.ts 的 getEditorScroller。
 const editorScroller = () => getEditorScroller() ?? editorEl()
@@ -28,6 +31,7 @@ const fileTabEl = () => document.getElementById('file-panel-files') as HTMLButto
 const outlineTabEl = () => document.getElementById('file-panel-outline') as HTMLButtonElement
 const fileToggleBtnEl = () => document.getElementById('file-toggle-btn') as HTMLButtonElement
 const sourceToggleBtnEl = () => document.getElementById('source-toggle-btn') as HTMLButtonElement
+const readingToggleBtnEl = () => document.getElementById('reading-mode-btn') as HTMLButtonElement
 const wordCountEl = () => document.getElementById('word-count') as HTMLElement
 const saveStatusEl = () => document.getElementById('save-status') as HTMLElement
 const updateBannerEl = () => document.getElementById('update-banner') as HTMLElement
@@ -157,6 +161,8 @@ function setMarkdownProgrammatically(content: string, flushHistory = false): voi
   } finally {
     applyingProgrammaticChange = false
   }
+  // 换文档会重建 EditorState，阅读模式的锁跟着丢了，这里盖回去
+  if (readingModeActive) applyReadingMode(true)
 }
 
 // --- Unsaved-state tracking + auto-save ---
@@ -506,6 +512,8 @@ function showBlankDocument(): void {
   } finally {
     applyingProgrammaticChange = false
   }
+  // 新建就是要写，阅读态在这里没有意义，直接退出
+  if (readingModeActive) applyReadingMode(false)
   updateWordCount('')
   resetDirty()
   updateFileTitle()
@@ -646,6 +654,8 @@ async function activateTab(id: string): Promise<void> {
       } finally {
         applyingProgrammaticChange = false
       }
+      // 切标签恢复的是另一份 EditorState，阅读态的锁同样要盖回去
+      if (readingModeActive) applyReadingMode(true)
     }
     // The tab's own unsaved state decides, never the swap itself.
     dirty = target.dirty
@@ -1013,6 +1023,24 @@ function updateSourceToggle(): void {
   setToolbarTip(btn, label)
 }
 
+/**
+ * 阅读模式按钮：语义标记（.active）+ 提示语。
+ *
+ * 标题栏按钮一律不点亮（见 base.css 里那段注释：会亮的东西把视线往标题栏拽），这颗是例外：
+ * 阅读模式改的是整篇的可编辑性，界面上没有别的痕迹能说明「现在点哪儿都改不动」，
+ * 所以它必须能自报状态。只改图标颜色，不加底色块。
+ */
+function updateReadingToggle(): void {
+  const btn = readingToggleBtnEl()
+  if (!btn) return
+  btn.classList.toggle('active', readingModeActive)
+  const zh = isChinese()
+  const label = readingModeActive
+    ? (zh ? '退出阅读模式 (Ctrl+Shift+R)' : 'Exit Reading Mode (Ctrl+Shift+R)')
+    : (zh ? '阅读模式 (Ctrl+Shift+R)' : 'Reading Mode (Ctrl+Shift+R)')
+  setToolbarTip(btn, label)
+}
+
 function updateUiLanguage(): void {
   const zh = isChinese()
   document.documentElement.lang = zh ? 'zh-CN' : 'en'
@@ -1024,6 +1052,7 @@ function updateUiLanguage(): void {
   const menuBtn = document.getElementById('app-menu-btn')
   if (menuBtn) setToolbarTip(menuBtn, zh ? '菜单' : 'Menu')
   updateSourceToggle()
+  updateReadingToggle()
   updateWordCount()
 }
 function scrollRatio(el: HTMLElement): number {
@@ -1094,6 +1123,30 @@ function toggleSourceMode(): void {
   }
   updateWordCount()
   scheduleOutlineUpdate()
+}
+
+/**
+ * 阅读模式：锁住输入，块级 widget（表格、图、HTML 块、块公式）不再因为光标落进去而退回源码。
+ *
+ * 只锁输入不够——表格点一下照样变成一排竖线管道符；只改装饰也不够——还能往里打字。
+ * 两件事都在 editor.ts 的 setReadingMode 里做，这里只管外壳：body 类、焦点、和源码模式的互斥。
+ *
+ * 容易被忽略的一点：换文件、切标签会**重建 EditorState**（见 core.ts 的 setText），
+ * 新 state 的 readingModeField 回到初值 false、可编辑性也回到 true。所以凡是有文档被
+ * 换进来的地方，都要再调一次这个函数把状态盖回去。
+ */
+function applyReadingMode(active: boolean): void {
+  if (active && sourceModeActive) exitSourceMode()
+  readingModeActive = active
+  setReadingMode(active)
+  document.body.classList.toggle('reading-mode', active)
+  updateReadingToggle()
+  // 阅读态没有光标，焦点还留在编辑器上会让选区边框一直亮着，像是还能编辑。
+  if (active) (document.activeElement as HTMLElement | null)?.blur?.()
+}
+
+function toggleReadingMode(): void {
+  applyReadingMode(!readingModeActive)
 }
 
 function cancelPendingPanelHide(): void {
@@ -1827,7 +1880,8 @@ async function toggleSlideshow(): Promise<void> {
       void window.electronAPI.setSlideshowFullscreen(true)
     },
     onExit: () => {
-      setEditorEditable(true)
+      // 阅读态下退出放映，锁要留着自己恢复，不能一律解禁
+      setEditorEditable(!readingModeActive)
       void window.electronAPI.setSlideshowFullscreen(false)
       if (wasSourceMode) enterSourceMode(content, sourceScrollRatio)
     }
@@ -1973,7 +2027,43 @@ async function init(): Promise<void> {
   api.onToggleFilePanel(() => togglePanel())
 
   sourceToggleBtnEl().addEventListener('click', toggleSourceMode)
+  readingToggleBtnEl().addEventListener('click', toggleReadingMode)
+
+  // 正文右键菜单。原生菜单由主进程弹，这里只报「光标下是什么」。
+  // 选区取 window.getSelection()：表格、图片这些 widget 里的文字不在 CodeMirror 的选择模型里，
+  // 源码模式的 textarea 又是另一套（它的选区只能从 value 上切）。
+  document.getElementById('editor-region')?.addEventListener('contextmenu', (event) => {
+    event.preventDefault()
+    const target = event.target as HTMLElement | null
+    const href = target?.closest('a')?.getAttribute('href') ?? ''
+    const selection = sourceModeActive
+      ? (() => {
+          const ta = sourceEl()
+          return ta.value.slice(ta.selectionStart ?? 0, ta.selectionEnd ?? 0)
+        })()
+      : (window.getSelection()?.toString() ?? '')
+    void window.electronAPI.showEditorContextMenu({
+      selection,
+      link: /^https?:/i.test(href) ? href : null,
+      image: target instanceof HTMLImageElement ? target.src : null,
+      // 阅读态不回传全选：那边全选选中的是文档源码区间，画出来跟看到的内容对不上
+      canSelectAll: !sourceModeActive && !readingModeActive,
+    })
+  })
   api.onToggleSourceMode(() => toggleSourceMode())
+  api.onToggleReadingMode(() => toggleReadingMode())
+  // 右键菜单里需要动编辑器的那几项绕回主进程后走这里。
+  api.onEditorMenuAction((action, value) => {
+    if (action === 'select-all') {
+      if (sourceModeActive) sourceEl().select()
+      else {
+        const view = getEditorView()
+        if (view) view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } })
+      }
+    } else if (action === 'open-image' && value) {
+      openImageOverlay(value)
+    }
+  })
   // Source-mode edits update the word count and mark the doc dirty in real time
   sourceEl().addEventListener('input', () => {
     setDirty()

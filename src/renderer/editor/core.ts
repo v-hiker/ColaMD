@@ -120,6 +120,21 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
         if (view.dom.isConnected) view.dispatch({ effects: setEditorFocus.of(false) })
         return false
       },
+      // 复制兜底：widget（表格、图、公式）里的文字不在 CodeMirror 的选择模型里。
+      // 阅读态下拖选一张表，原生选区是有内容的，但 state.selection 仍然是空的 —— CM6 的
+      // copy 处理只在它自己有选区时接管，于是两边都不动，剪贴板最后是空的
+      // （2026-11-20 用户报的「阅读模式表格内容复制不了」）。
+      // 这里补一条：CM6 没有选区、而原生选区有内容时，用原生文本写剪贴板并拦下事件。
+      // 编辑态不受影响——那时 CM6 自己一定有选区，下面直接放行。
+      copy: (event, view) => {
+        if (!view.state.selection.main.empty) return false
+        const selected = document.getSelection()
+        const text = selected?.toString() ?? ''
+        if (text === '') return false
+        event.clipboardData?.setData('text/plain', text)
+        event.preventDefault()
+        return true
+      },
     }),
     // 回车续列表。这是编辑器的输入手感，与渲染无关，所以单独一个模块。
     listInput,
