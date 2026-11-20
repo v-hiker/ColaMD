@@ -30,6 +30,7 @@ import { scanMath, excludedRanges, frontmatterRange, type Excluded, type MathRan
 import { renderMermaid, attachDiagramZoom, detachDiagramZoom, isDiagramZoomed } from './mermaid-bridge'
 import { sanitizeHTML, cleanStyle } from './html-sanitize'
 import { footnoteDefinitions, footnoteNumbers, FOOTNOTE_REF_RE } from './footnotes'
+import { observeTableLayout, stopObservingTableLayout } from './table-layout'
 import { isChinese } from '../ui-language'
 
 /** 给区间加样式类，不隐藏任何字符。 */
@@ -903,7 +904,12 @@ class TableWidget extends WidgetType {
       tbody.appendChild(tr)
     }
     table.appendChild(tbody)
+    observeTableLayout(table, remeasureAfterDraw)
     return table
+  }
+
+  destroy(dom: HTMLElement): void {
+    stopObservingTableLayout(dom)
   }
 }
 
@@ -1669,7 +1675,8 @@ export const livePreviewField = StateField.define<DecorationSet>({
     const rebased = tr.effects.some((effect) => effect.is(setDocumentFileUrlEffect))
     const clean = tr.state.field(cleanExportField, false) ?? false
     const wasClean = tr.startState.field(cleanExportField, false) ?? false
-    if (!tr.docChanged && !flash && !parsed && !rebased && clean === wasClean) {
+    const readingChanged = readingMode(tr.state) !== readingMode(tr.startState)
+    if (!tr.docChanged && !flash && !parsed && !rebased && clean === wasClean && !readingChanged) {
       if (!tr.selection) return deco
       const zones = zonesByDeco.get(deco) ?? []
       if (activeZonesKey(tr.state, zones) === activeZonesKey(tr.startState, zones)) {

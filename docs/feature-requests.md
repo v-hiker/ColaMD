@@ -42,6 +42,20 @@ The two items below are the ones actually blocking us. Everything else on this p
 
 **How to help:** comment on [#88](https://github.com/marswaveai/ColaMD/issues/88) with the failing document (or a cut-down version), the platform, the export option used, and whether the current release still fails.
 
+## Custom Branch
+
+### Read-only source and rendered table selection
+
+The reading toggle applies to both rendered and source views, so readers can inspect and copy Markdown without editing it. In reading mode, dragging across a rendered table selects its visible text for copying.
+
+### Adaptive table column widths
+
+Rendered text tables can give a column slightly more width when doing so reduces wrapping across the whole table. The layout uses measured text widths and updates as the available width changes.
+
+### Emphasis next to CJK punctuation
+
+The editor recognizes asterisk emphasis around a CJK quotation directly following text, and after a CJK closing bracket or quotation mark directly followed by text.
+
 ## Implemented On Main
 
 ### Inline HTML pairs (#125)

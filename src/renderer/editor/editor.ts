@@ -254,14 +254,10 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
     })
   })
 
-  // 表格：按点到的那一格落光标（#153）。
-  //
-  // 必须挂在 mousedown 并在**捕获阶段**拦下来。挂 click 不行：mousedown 时 CM6 先把
-  // 光标放到块开头，isBlockActive 一看光标已经在块里，整块退回源码，widget 随即从
-  // DOM 上摘掉；等 click 事件到达时，它的 target 已经不在树上，算不出点到哪一格
-  // （实测连跑三轮都是这样：源码退回了，打的字却落在表格开头）。
+  // 编辑时按点到的单元格落光标（#153），阅读时交给浏览器拖选。
+  // 编辑态在捕获阶段处理 mousedown，避免编辑器先把表格切成源码后丢失单元格位置。
   root.addEventListener('mousedown', (e) => {
-    if (e.button !== 0) return
+    if (e.button !== 0 || view.state.readOnly) return
     const widget = tableWidgetOf(e.target)
     if (!widget) return
     const anchor = tableCellAnchor(view, widget, e)
@@ -279,8 +275,9 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
   // #138 报上来：换内核之后表格、图、图片都点不进去了，而 2.6 是可以改的。
   // 现在每个替换块都带着自己的源码区间（见 live-preview 的 withSourceRange），
   // 一个处理器管全部；块级 widget 的光标落点有 isBlockActive 兜着，光标进去就露源码。
-  // 表格不在这里：它按点到的那一格落光标，走上面那条 mousedown。
+  // 表格按点到的单元格落光标，由上面的处理器负责。
   root.addEventListener('click', (e) => {
+    if (view.state.readOnly && tableWidgetOf(e.target)) return
     // 图上的缩放控件、以及放大态下的图，都是控件自己的地盘：点一下就把光标送进源码，
     // 图当场没了，正在看的局部也就白缩了（控件由 mermaid-bridge 的 attachDiagramZoom 装）。
     const hit = e.target as HTMLElement
@@ -479,6 +476,20 @@ async function writeRichCopy(
  * 我们返回 true 也拦不住它，实测 text/html 会被它清掉。
  */
 function setupRichCopy(root: HTMLElement): void {
+  // 表格 widget 的原生选区与 CodeMirror 的源码选区独立。优先复制拖选到的表格内容，
+  // 包括多单元格间的制表符和换行。
+  document.addEventListener('copy', (event) => {
+    if (!getEditorView()?.state.readOnly) return
+    const target = event.target
+    if (target !== document.body && (!(target instanceof Node) || !root.contains(target))) return
+    const selection = document.getSelection()
+    if (!event.clipboardData || !selection || selection.isCollapsed) return
+    const table = tableWidgetOf(selection.anchorNode?.parentElement ?? null)
+    if (!table || !root.contains(table) || !root.contains(selection.focusNode)) return
+    event.clipboardData.setData('text/plain', selection.toString())
+    event.preventDefault()
+    event.stopPropagation()
+  }, true)
   root.addEventListener('copy', (event) => {
     if (!(event instanceof ClipboardEvent)) return
     const view = getEditorView()

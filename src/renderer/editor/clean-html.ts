@@ -7,6 +7,8 @@
 // 所以这里做一次翻译：行 → `<p>`，连续的同类行合并成 `<ul>`/`<ol>`/`<blockquote>`/`<pre>`，
 // 装饰类 → 语义标签。**只读**：它不改编辑器里的任何东西，改的是要交出去的那份拷贝。
 
+import { TABLE_COLUMN_MIN_WIDTH } from './table-layout'
+
 /** 元素上的装饰类 → 语义标签。没登记的类原样透传（KaTeX、mermaid、图片要保住）。 */
 const INLINE_TAGS: Record<string, string> = {
   'cm-md-strong': 'strong',
@@ -235,7 +237,10 @@ function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): str
     // 表格本身是语义标签，编辑器自己的东西只有类名和定位属性。
     // 单元格里的行内公式外面还套着一层 `<span class="cm-md-math">`，整棵克隆会
     // 把它带出去（#198 合进来之后暴露的），所以先拆外壳再剥类名。
-    const clone = table.cloneNode(true) as HTMLElement
+    const clone = table.cloneNode(true) as HTMLTableElement
+    for (const header of Array.from(clone.tHead?.rows[0]?.cells ?? [])) {
+      header.style.removeProperty(TABLE_COLUMN_MIN_WIDTH)
+    }
     for (const shell of Array.from(clone.querySelectorAll<HTMLElement>('.cm-md-math, .cm-md-mermaid-ready'))) {
       shell.replaceWith(...Array.from(shell.childNodes))
     }

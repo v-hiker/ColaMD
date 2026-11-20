@@ -322,6 +322,15 @@
   padding: 0.25em 0;
 }
 
+body.reading-mode .cm-content .cm-md-table-widget {
+  user-select: text;
+}
+
+/* 表格内使用原生选区，覆盖 CodeMirror 为正文选区层关闭的原生高亮。 */
+body.reading-mode .cm-content .cm-md-table-widget ::selection {
+  background-color: var(--selection-bg, color-mix(in srgb, var(--text-color) 18%, transparent)) !important;
+}
+
 .cm-content .cm-md-table-widget th,
 .cm-content .cm-md-table-widget td {
   border: 1px solid var(--border-color);

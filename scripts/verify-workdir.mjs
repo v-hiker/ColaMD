@@ -9,7 +9,7 @@
 // 「换个脚本跑就换了初始状态」的假红。所以是每个脚本一份，而不是全仓一份。
 import { mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const ROOT = join(homedir(), 'Library', 'Caches', 'colamd-verify')
@@ -41,7 +41,7 @@ export function stopVerifyApp(marker = ROOT) {
 export function verifyWorkdir(name) {
   const dir = join(ROOT, name)
   // 只擦自己名下这一格，别碰 Caches 里别人的东西
-  if (!dir.startsWith(`${ROOT}/`)) throw new Error(`工作目录必须落在 ${ROOT} 下：${dir}`)
+  if (!dir.startsWith(`${ROOT}${sep}`)) throw new Error(`工作目录必须落在 ${ROOT} 下：${dir}`)
   // 上一轮要是被强杀了，先把它的进程收掉，再擦目录：不然进程还占着文件
   stopVerifyApp(ROOT)
   wipe(dir)

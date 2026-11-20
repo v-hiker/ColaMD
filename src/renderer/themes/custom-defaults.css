@@ -43,15 +43,12 @@
 #editor .cm-content .cm-md-table-widget th {
   background: color-mix(in srgb, var(--text-color) 4%, var(--bg-color));
   font-weight: 600;
-  white-space: nowrap;
+  min-width: var(--cm-md-column-min-width, 0);
   border-bottom-color: color-mix(in srgb, var(--text-color) 22%, var(--border-color));
 }
 
-/* 第一列给一个下限：不给的话「核心解决痛点」会被压成竖排的单字。 */
-#editor .cm-content .cm-md-table-widget th:first-child,
-#editor .cm-content .cm-md-table-widget td:first-child {
-  white-space: normal;
-  min-width: 5.5em;
+#editor .cm-content .cm-md-table-widget.cm-md-table-measuring :is(th, td) {
+  white-space: nowrap;
 }
 
 /* 格子里的行内代码跟着表格字号走，别在 1em 的表里缩成正文那个 0.875em。 */

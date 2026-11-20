@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -332,6 +332,160 @@ try {
   const editBack = await toggle('source', newHead)
   check('编辑后再次切源码保留新内容与可见光标', await evaluate(`document.getElementById('source-editor').value`) === edited && editBack.selection.anchor === newHead && editBack.selection.head === newHead && editBack.visible, editBack)
 
+  const readingText = '# 阅读模式\n\n| 标题 | 说明 |\n| --- | --- |\n| **单元格甲** | 单元格乙 |\n'
+  const readingFile = join(runtime, 'reading.md')
+  writeFileSync(readingFile, readingText)
+  await openFixture(readingFile, readingText)
+  const readingToggle = () => evaluate(`document.getElementById('reading-mode-btn').click()`)
+  await readingToggle()
+  await toggle('source', 0)
+  check('阅读模式可以打开只读源码', await evaluate(`document.getElementById('source-editor').readOnly && v.state.readOnly`))
+  const sourceSelection = await evaluate(`(() => {
+    const source = document.getElementById('source-editor')
+    source.setSelectionRange(0, 6)
+    return source.value.slice(source.selectionStart, source.selectionEnd)
+  })()`)
+  check('只读源码允许选中 Markdown 标记', sourceSelection === readingText.slice(0, 6), sourceSelection)
+  await send('Input.insertText', { text: '只读不可写' })
+  check('只读源码拒绝输入', await evaluate(`document.getElementById('source-editor').value`) === readingText)
+  await readingToggle()
+  check('在源码视图退出阅读模式可继续编辑', await mode() === 'source' && await evaluate(`!document.getElementById('source-editor').readOnly`))
+  await evaluate(`document.getElementById('source-editor').setSelectionRange(2, 2)`)
+  await send('Input.insertText', { text: '源码' })
+  const readingEdited = readingText.slice(0, 2) + '源码' + readingText.slice(2)
+  await readingToggle()
+  check('在源码视图开启阅读模式保留当前视图和选区', await mode() === 'source' && await evaluate(`document.getElementById('source-editor').readOnly && document.getElementById('source-editor').selectionStart === 4`))
+  await toggle('render', 4)
+  check('切回只读渲染时同步此前源码修改', await evaluate('v.state.doc.toString()') === readingEdited && await evaluate('v.state.readOnly'))
+
+  const originalTheme = await evaluate(`[...document.body.classList].find(name => name.startsWith('theme-'))`)
+  for (const theme of ['dark', 'light']) {
+    await evaluate(`(() => {
+      for (const name of [...document.body.classList]) if (name.startsWith('theme-')) document.body.classList.remove(name)
+      document.body.classList.add('theme-${theme}')
+    })()`)
+    await waitFor("document.querySelector('.cm-md-table-widget td strong')", '渲染表格未就绪')
+    const { start, end, color } = await evaluate(`(() => {
+      const [first, last] = document.querySelectorAll('.cm-md-table-widget td')
+      const a = first.querySelector('strong'), b = last
+      const center = (el, offset) => {
+        const range = document.createRange()
+        range.setStart(el.firstChild, offset)
+        range.collapse(true)
+        const r = range.getBoundingClientRect()
+        return { x: r.x, y: r.y + r.height / 2 }
+      }
+      return { start: center(a, 0), end: center(b, b.textContent.length), color: getComputedStyle(a, '::selection').backgroundColor }
+    })()`)
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...start })
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...start, button: 'left', buttons: 1, clickCount: 1 })
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...end, button: 'left', buttons: 1 })
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...end, button: 'left', clickCount: 1 })
+    // 用真实复制快捷键触发 copy，接住写入内容，避免改动系统剪贴板。
+    await evaluate(`window.tableCopy = null; window.addEventListener('copy', event => {
+      const clipboard = new DataTransfer()
+      Object.defineProperty(event, 'clipboardData', { value: clipboard })
+      event.preventDefault()
+      setTimeout(() => { window.tableCopy = clipboard.getData('text/plain') }, 0)
+    }, { capture: true, once: true })`)
+    for (const type of ['rawKeyDown', 'keyUp']) {
+      await send('Input.dispatchKeyEvent', { type, key: 'c', code: 'KeyC', windowsVirtualKeyCode: 67, modifiers: process.platform === 'darwin' ? 4 : 2 })
+    }
+    await waitFor('window.tableCopy !== null', '复制快捷键未触发 copy')
+    const selected = await evaluate(`({ selection: getSelection().toString(), text: window.tableCopy, stillRendered: !!document.querySelector('.cm-md-table-widget') })`)
+    check(`${theme} 阅读模式可跨单元格拖选并复制可见文本`, selected.stillRendered && selected.selection === '单元格甲\t单元格乙' && selected.text === selected.selection, selected)
+    check(`${theme} 表格原生选区可见`, color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent', color)
+  }
+  await readingToggle()
+  const cell = await evaluate(`(() => {
+    getSelection().removeAllRanges()
+    document.body.classList.replace('theme-light', ${JSON.stringify(originalTheme ?? 'theme-light')})
+    const r = document.querySelector('.cm-md-table-widget td:nth-child(2)').getBoundingClientRect()
+    return { x: r.left + 16, y: r.top + r.height / 2 }
+  })()`)
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await send('Input.dispatchMouseEvent', { type, ...cell, button: 'left', clickCount: 1 })
+  }
+  check('编辑模式单击仍定位到对应单元格源码', await evaluate(`!document.querySelector('.cm-md-table-widget') && v.state.selection.main.head === ${readingEdited.indexOf(' 单元格乙')}`))
+  await readingToggle()
+  check('在表格源码内开启阅读模式会恢复表格渲染', await evaluate(`v.state.readOnly && !!document.querySelector('.cm-md-table-widget')`))
+  await readingToggle()
+
+  const tableRowsForLayout = [
+    ['任务清单输出', '表格只列出每项任务自己的编号、名称和进度，缺少关联信息，还要手工翻查其他记录。', '自动列出当前分组内每项任务的关联记录，并按实际进度输出一份完整清单。'],
+    ['分类排序与去重', '手工整理时容易把同一分组内的相邻任务、不同分组内的重复任务记错。', '先按当前的分类规则确定任务分组，再按统一的标准排序并去重。'],
+    ['筛选条件与范围', '包含已归档或状态不详的记录时，手动筛选容易跳过需要核对的条目。', '可以明确选择时间范围与处理状态，也可以一次查看所有待确认的条目。'],
+    ['页面预览与更正', '选中一条记录时看不出还有哪些关联条目，需要在两个页面之间来回切换。', '可以在预览中展开和更正关联条目，选中的记录会同时在列表里高亮。'],
+    ['导出表格稳定性', '删除一条重复记录或只导出其中一个分组时，手工写入的行号容易错位。', '使用记录自己的编号进行匹配，导出时按照当前的显示顺序重新编号。'],
+    ['结果一致性', '不同人先后两次手工整理，最终的任务排列顺序不统一。', '先确定每个分组的顺序，再按组内编号排列，便于核对前后两次结果。'],
+  ]
+  const markdownTable = (head, columns) => [head, ['---', '---', '---'],
+    ...tableRowsForLayout.map(row => columns.map(index => index === 0 ? `**${row[index]}**` : row[index])),
+  ].map(row => `| ${row.join(' | ')} |`).join('\n')
+  const layoutText = '# 表格列宽\n\n' + markdownTable(['对比维度', '功能添加前', '功能添加后'], [0, 1, 2]) + '\n\n' +
+    markdownTable(['A', 'B', 'C'], [1, 2, 0]) + '\n'
+  const layoutFile = join(runtime, 'table-layout.md')
+  writeFileSync(layoutFile, layoutText)
+  await openFixture(layoutFile, layoutText)
+  await evaluate(`window.measureTables = () => Array.from(document.querySelectorAll('.cm-md-table-widget'), (table, index) => {
+    const column = index === 0 ? 0 : 2
+    const countLines = (cell) => {
+      const range = document.createRange()
+      range.selectNodeContents(cell.querySelector('strong') || cell)
+      return Math.max(1, range.getClientRects().length)
+    }
+    const size = () => ({
+      wrappedLabels: Array.from(table.tBodies[0].rows).filter(row => countLines(row.cells[column]) > 1).length,
+      lines: Array.from(table.rows).reduce((sum, row) => sum + Array.from(row.cells).reduce((subtotal, cell) => subtotal + countLines(cell), 0), 0),
+      fits: table.offsetWidth <= table.parentElement.clientWidth + 1,
+    })
+    const adjusted = size()
+    const headers = Array.from(table.tHead.rows[0].cells)
+    const widths = headers.map(th => th.style.getPropertyValue('--cm-md-column-min-width'))
+    for (const th of headers) th.style.removeProperty('--cm-md-column-min-width')
+    const automatic = size()
+    headers.forEach((th, i) => { if (widths[i]) th.style.setProperty('--cm-md-column-min-width', widths[i]) })
+    return { adjusted, automatic, widths }
+  })`)
+  const layoutWide = await evaluate('measureTables()')
+  check('根据实际折行改善短文本列，列名和位置不影响判断', layoutWide.length === 2 && layoutWide.every(({ adjusted, automatic }) =>
+    adjusted.fits && adjusted.wrappedLabels === 0 && automatic.wrappedLabels > 0 && adjusted.lines < automatic.lines), layoutWide)
+  await send('Emulation.setDeviceMetricsOverride', { width: 600, height: 780, deviceScaleFactor: 1, mobile: false })
+  await evaluate('viewportProbe.settle("render", 0)')
+  const layoutNarrow = await evaluate('measureTables()')
+  check('窗口变窄后重新分配列宽并保持表格放得下', layoutNarrow.length === 2 && layoutNarrow.every(({ adjusted, automatic }) =>
+    adjusted.fits && adjusted.lines <= automatic.lines), layoutNarrow)
+  await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 780, deviceScaleFactor: 1, mobile: false })
+
+  const cjkText = [
+    '# 中文强调',
+    '',
+    '1. **分组与排序原则**',
+    '   - 查询范围限定在**当前分组（含已归档记录）**内部，其他分组单独处理；',
+    '   - 在这里注明*“无需逐项核对”*、在另一项注明*“排序规则见下文”*。',
+    '',
+    '边界：word*"literal"*word，`注明*“代码”*`，\\*“已转义”\\*。',
+    '',
+    '普通强调：中文**加粗**和*斜体*。',
+    '',
+  ].join('\n')
+  const cjkFile = join(runtime, 'cjk-emphasis.md')
+  writeFileSync(cjkFile, cjkText)
+  await openFixture(cjkFile, cjkText)
+  const cjkRendering = await evaluate(`(() => {
+    const content = v.contentDOM
+    const marks = (selector) => Array.from(content.querySelectorAll(selector), mark => mark.textContent)
+    return { bold: marks('.cm-md-strong'), italic: marks('.cm-md-em'), code: marks('.cm-md-inlinecode'), text: content.textContent }
+  })()`)
+  check('中文闭括号后的星号可以闭合加粗', cjkRendering.bold.includes('当前分组（含已归档记录）') &&
+    cjkRendering.text.includes('当前分组（含已归档记录）内部'), cjkRendering)
+  check('两处中文引号分别斜体，中间文字维持正文', JSON.stringify(cjkRendering.italic) ===
+    JSON.stringify(['“无需逐项核对”', '“排序规则见下文”', '斜体']), cjkRendering)
+  check('普通强调、行内代码与字面星号继续正常解析', cjkRendering.bold.includes('加粗') &&
+    cjkRendering.code.includes('注明*“代码”*') && cjkRendering.text.includes('word*"literal"*word') &&
+    cjkRendering.text.includes('\\*“已转义”\\*'), cjkRendering)
+  check('中文强调预览保留源码及磁盘字节', await evaluate('v.state.doc.toString()') === cjkText && readFileSync(cjkFile, 'utf8') === cjkText)
+
   // 源码位置按真实排版测量，代价随光标前的文字线性增长。用接近整篇源码阈值
   // （512K 字符）的文档记录切换耗时，防止退化成多次全文排版。
   let large = '', index = 0
@@ -371,7 +525,6 @@ try {
   if (child.exitCode === null) child.kill('SIGTERM')
   if (child.exitCode === null) await Promise.race([new Promise(resolve => child.once('exit', resolve)), pause(2000)])
   if (child.exitCode === null) child.kill('SIGKILL')
-  rmSync(runtime, { recursive: true, force: true })
   const report = out ? join(out, `${label}.json`) : null
   if (report) writeFileSync(report, JSON.stringify(transcript, null, 2) + '\n')
   console.log(JSON.stringify({ passed: transcript.passed, failed: transcript.failed, exitCode, report }))

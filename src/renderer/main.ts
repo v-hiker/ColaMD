@@ -657,8 +657,8 @@ async function activateTab(id: string): Promise<void> {
       } finally {
         applyingProgrammaticChange = false
       }
-      // 切标签恢复的是另一份 EditorState，阅读态的锁同样要盖回去
-      if (readingModeActive) applyReadingMode(true)
+      // 标签快照可能是在不同的阅读状态下保存的。
+      applyReadingMode(readingModeActive)
     }
     // The tab's own unsaved state decides, never the swap itself.
     dirty = target.dirty
@@ -1132,20 +1132,20 @@ function toggleSourceMode(): void {
  * 阅读模式：锁住输入，块级 widget（表格、图、HTML 块、块公式）不再因为光标落进去而退回源码。
  *
  * 只锁输入不够——表格点一下照样变成一排竖线管道符；只改装饰也不够——还能往里打字。
- * 两件事都在 editor.ts 的 setReadingMode 里做，这里只管外壳：body 类、焦点、和源码模式的互斥。
+ * 源码视图由 textarea 的只读属性锁住，保留它的选区和滚动位置。
  *
  * 容易被忽略的一点：换文件、切标签会**重建 EditorState**（见 core.ts 的 setText），
  * 新 state 的 readingModeField 回到初值 false、可编辑性也回到 true。所以凡是有文档被
  * 换进来的地方，都要再调一次这个函数把状态盖回去。
  */
 function applyReadingMode(active: boolean): void {
-  if (active && sourceModeActive) exitSourceMode()
   readingModeActive = active
+  sourceEl().readOnly = active
   setReadingMode(active)
   document.body.classList.toggle('reading-mode', active)
   updateReadingToggle()
   // 阅读态没有光标，焦点还留在编辑器上会让选区边框一直亮着，像是还能编辑。
-  if (active) (document.activeElement as HTMLElement | null)?.blur?.()
+  if (active && !sourceModeActive) (document.activeElement as HTMLElement | null)?.blur?.()
 }
 
 function toggleReadingMode(): void {

@@ -228,9 +228,13 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
       if (view.state.doc.toString() === text) return
       // 换文件时必须把撤销栈清掉，否则撤销会跨文档串味。光标也要落到正文开头：
       // 属性区是收起来的，停在它里面敲出来的字会看不见（见 state.ts 的 bodyStart）。
+      // 同步源码视图的内容时，程序化替换可以通过只读输入锁。
       const next = clearHistory
         ? EditorState.create({ doc: text, selection: { anchor: bodyStart(text) }, extensions: extension })
-        : view.state.update({ changes: { from: 0, to: view.state.doc.length, insert: text } }).state
+        : view.state.update({
+          changes: { from: 0, to: view.state.doc.length, insert: text },
+          filter: false,
+        }).state
       view.setState(next)
     },
 
