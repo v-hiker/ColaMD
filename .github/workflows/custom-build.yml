@@ -1,11 +1,20 @@
-# 自己的构建流水线：把上游更新合进 custom，然后打一个 Windows 绿色版。
+# 自己的构建流水线：合并上游 → 打安装包 → 发到你自己的仓库。
 #
-# 为什么不复用上游的 release.yml：那个跑三平台 + macOS 签名公证，需要证书，
-# 而且 publish 指向 marswaveai/ColaMD —— 在 fork 上跑会试图往上游发 release。
+# 为什么必须发 Release、而不是只丢 artifact：
+# 应用里的「检查更新」走 electron-updater，它请求的是
+#     https://github.com/<owner>/<repo>/releases/latest/download/latest.yml
+# artifact 不在这个位置，拿不到。所以打包时 publish 要指向 v-hiker/ColaMD，
+# 并且真的创建正式 release（不是 draft，draft 的 asset 外部取不到）。
 #
-# 这里只做一件事：windows-latest 上出 zip（解压即用的绿色版），丢进 Actions
-# artifact。版本号沿用 package.json，文件名另加 commit 短 sha，避免和上游的
-# ColaMD-<version>-win-x64.zip 混在一起。
+# 品牌独立：electron-builder.yml 里的 appId 是 ai.marswave.colamd，和官方版一样。
+# 同一个 appId 装第二个，NSIS 会当成同产品的升级，顶掉已装的官方版。这里用命令行
+# 覆盖（不改 electron-builder.yml，改它每次 rebase 都会冲突）：
+#   appId       -> ai.marswave.colamd.custom
+#   productName -> ColaMD Custom
+# 主题目录 ~/.colamd/themes 按 home 拼，不跟 productName 走，两个版本共用主题。
+#
+# 版本号：跟随上游 package.json。上游发 2.7.13，rebase 后构建出来的就是 2.7.13，
+# 装在机器上的 2.7.12 会收到更新提示。
 
 name: custom-build
 
@@ -14,7 +23,7 @@ on:
     branches: [custom]
   workflow_dispatch:
   schedule:
-    # 每天 UTC 17:37（北京时间 01:37）检查一次上游，有更新就同步并构建。
+    # 每天 UTC 17:37（北京 01:37）检查上游
     - cron: '37 17 * * *'
 
 permissions:
@@ -24,19 +33,26 @@ concurrency:
   group: custom-build
   cancel-in-progress: false
 
+env:
+  APP_ID: ai.marswave.colamd.custom
+  APP_NAME: ColaMD Custom
+  REPO_OWNER: ${{ github.repository_owner }}
+  REPO_NAME: ${{ github.event.repository.name }}
+
 jobs:
   sync:
-    name: 合并上游
+    name: 检查上游
     runs-on: ubuntu-latest
     outputs:
       updated: ${{ steps.rebase.outputs.updated }}
+      behind: ${{ steps.rebase.outputs.behind }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: custom
           fetch-depth: 0
 
-      - name: Rebase onto upstream/main
+      - name: 对比上游并同步
         id: rebase
         run: |
           git config user.name  "github-actions[bot]"
@@ -44,18 +60,22 @@ jobs:
           git remote add upstream https://github.com/marswaveai/ColaMD.git
           git fetch upstream main --tags
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "上游没有新提交，跳过。"
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "custom 落后 upstream/main $behind 个提交"
+
+          if [ "$behind" -eq 0 ]; then
+            echo "=== 上游没有新提交，跳过构建 ==="
             echo "updated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "上游新增："
+          echo "=== 上游新增 ==="
           git --no-pager log --oneline HEAD..upstream/main | head -20
 
           if ! git rebase upstream/main; then
             echo "::error::上游改动和我们的提交冲突，自动变基失败。"
-            echo "::error::本地执行：git fetch upstream && git rebase upstream/main，解决后 push 到 custom。"
+            echo "::error::本地：git fetch upstream && git rebase upstream/main，解决后 push 到 custom。"
             git rebase --abort
             exit 1
           fi
@@ -64,10 +84,13 @@ jobs:
           echo "updated=true" >> "$GITHUB_OUTPUT"
 
   build:
-    name: 构建 Windows 绿色版
+    name: 构建并发布
     needs: sync
-    # 定时触发的 run 只在真有上游更新时构建；手动和 push 触发一律构建。
-    if: needs.sync.outputs.updated == 'true' || github.event_name != 'schedule'
+    # 推代码 / 手动触发一律构建；定时任务只在真有上游更新时构建
+    if: |
+      needs.sync.outputs.updated == 'true' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -94,30 +117,56 @@ jobs:
       - name: 构建渲染层
         run: npm run build
 
-      # --publish never 是必须的：electron-builder.yml 里的 publish 指向
-      # marswaveai/ColaMD，不加这个会把产物往上游的 release 发（而且没权限）。
-      # 目标不写死：按 electron-builder.yml 的 win.target 走，即 nsis 安装包 + zip 绿色版。
-      - name: 打包（安装包 + 绿色版）
-        run: npx electron-builder --win --publish never
+      # --publish always：把安装包、latest.yml、blockmap 发到 REPO_OWNER/REPO_NAME。
+      # tag 不带 v 前缀（vPrefixedTagName=false）：fork 里带着上游的 v2.7.12 tag，
+      # 用 2.7.12 可以避开它，release 才不会挂到上游那个 commit 上。
+      - name: 打包并发布
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $argv = @(
+            '--win',
+            '--publish', 'always',
+            "-c.appId=$env:APP_ID",
+            "-c.productName=$env:APP_NAME",
+            "-c.publish.provider=github",
+            "-c.publish.owner=$env:REPO_OWNER",
+            "-c.publish.repo=$env:REPO_NAME",
+            '-c.publish.releaseType=release',
+            '-c.publish.vPrefixedTagName=false',
+            '-c.win.artifactName=ColaMD-Custom-${version}-win-${arch}.${ext}',
+            '-c.nsis.artifactName=ColaMD-Custom-Setup-${version}.${ext}'
+          )
+          npx electron-builder @argv
 
-      - name: 改名带 sha
+      - name: 打包结果
         shell: pwsh
         run: |
-          $short = "${{ github.sha }}".Substring(0, 7)
-          Get-ChildItem release -Filter *.exe | Where-Object { $_.Name -like 'ColaMD-Setup-*' } | ForEach-Object {
-            Rename-Item $_.FullName "ColaMD-custom-$short-Setup.exe"
-            Write-Host "-> ColaMD-custom-$short-Setup.exe"
-          }
-          Get-ChildItem release -Filter *.zip | ForEach-Object {
-            Rename-Item $_.FullName "ColaMD-custom-$short-win64.zip"
-            Write-Host "-> ColaMD-custom-$short-win64.zip"
-          }
+          Get-ChildItem release -File | Where-Object { $_.Extension -in '.exe', '.zip', '.yml', '.blockmap' } |
+            ForEach-Object { Write-Host ("  {0,-46} {1,8:N1} MB" -f $_.Name, ($_.Length / 1MB)) }
 
+      # 顺手留一份 artifact：release 下载走的是 Releases 页面，artifact 方便不用翻版本
       - uses: actions/upload-artifact@v4
         with:
-          name: ColaMD-custom-win64
+          name: ColaMD-Custom-win64
           path: |
-            release/ColaMD-custom-*-Setup.exe
-            release/ColaMD-custom-*-win64.zip
+            release/*.exe
+            release/*.zip
+            release/latest.yml
           retention-days: 30
           if-no-files-found: error
+
+      - name: 摘要
+        if: always()
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          @(
+            "### custom-build",
+            "",
+            "- 版本: ``$version``（跟随上游）",
+            "- 品牌: ``$env:APP_NAME`` / ``$env:APP_ID``",
+            "- 上游同步: ``${{ needs.sync.outputs.updated }}``（落后 ${{ needs.sync.outputs.behind }} 个提交）",
+            "- Release: https://github.com/$env:REPO_OWNER/$env:REPO_NAME/releases/tag/$version"
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
