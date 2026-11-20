@@ -1,0 +1,51 @@
+name: custom-sync
+
+on:
+  schedule:
+    # 每天北京时间 01:37 检查官方正式版本。
+    - cron: '37 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: custom-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 合并官方正式版本
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: 检查并合并最新正式版
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/marswaveai/ColaMD/releases/latest --jq .tag_name)
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::上游正式版标签不符合版本格式：$tag"
+            exit 1
+          fi
+
+          git fetch --no-tags https://github.com/marswaveai/ColaMD.git "refs/tags/$tag"
+          upstream=$(git rev-parse 'FETCH_HEAD^{commit}')
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "custom 已包含上游正式版 $tag"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git merge --no-ff -m "Merge upstream $tag" "$upstream"; then
+            echo "::error::合并上游 $tag 遇到冲突，需要在 custom 分支手动处理。"
+            git merge --abort
+            exit 1
+          fi
+          git push origin HEAD:refs/heads/custom

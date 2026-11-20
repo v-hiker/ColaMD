@@ -1,111 +1,44 @@
-# 自己的构建流水线：合并上游 → 打安装包 → 发到你自己的仓库。
-#
-# 为什么必须发 Release、而不是只丢 artifact：
-# 应用里的「检查更新」走 electron-updater，它请求的是
-#     https://github.com/<owner>/<repo>/releases/latest/download/latest.yml
-# artifact 不在这个位置，拿不到。所以打包时 publish 要指向 v-hiker/ColaMD，
-# 并且真的创建正式 release（不是 draft，draft 的 asset 外部取不到）。
-#
-# 品牌独立：electron-builder.yml 里的 appId 是 ai.marswave.colamd，和官方版一样。
-# 同一个 appId 装第二个，NSIS 会当成同产品的升级，顶掉已装的官方版。这里用命令行
-# 覆盖（不改 electron-builder.yml，改它每次 rebase 都会冲突）：
-#   appId       -> ai.marswave.colamd.custom
-#   productName -> ColaMD Custom
-# 主题目录 ~/.colamd/themes 按 home 拼，不跟 productName 走，两个版本共用主题。
-#
-# 版本号：跟随上游 package.json。上游发 2.7.13，rebase 后构建出来的就是 2.7.13，
-# 装在机器上的 2.7.12 会收到更新提示。
-
 name: custom-build
 
 on:
   push:
-    branches: [custom]
+    # 数字标签用于 fork 的 Windows Release，官方工作流使用 v 前缀。
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
-  schedule:
-    # 每天 UTC 17:37（北京 01:37）检查上游
-    - cron: '37 17 * * *'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: custom-build
+  group: custom-build-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  # 品牌不覆盖：appId / productName / 产物名全部用 electron-builder.yml 的默认值，
-  # 也就是 ai.marswave.colamd、ColaMD、ColaMD-Setup-<version>.exe。
-  # userData 因此落在 %APPDATA%\colamd，与官方版同一份 profile——语言、窗口位置、
-  # 主题选择、面板宽度都沿用，换过来装不用重配（装新版会按 appId 识别成官方版的升级）。
-  REPO_OWNER: ${{ github.repository_owner }}
-  REPO_NAME: ${{ github.event.repository.name }}
-
 jobs:
-  sync:
-    name: 检查上游
-    runs-on: ubuntu-latest
-    outputs:
-      updated: ${{ steps.rebase.outputs.updated }}
-      behind: ${{ steps.rebase.outputs.behind }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: custom
-          fetch-depth: 0
-
-      - name: 对比上游并同步
-        id: rebase
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/marswaveai/ColaMD.git
-          git fetch upstream main --tags
-
-          behind=$(git rev-list --count HEAD..upstream/main)
-          echo "behind=$behind" >> "$GITHUB_OUTPUT"
-          echo "custom 落后 upstream/main $behind 个提交"
-
-          if [ "$behind" -eq 0 ]; then
-            echo "=== 上游没有新提交，跳过构建 ==="
-            echo "updated=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "=== 上游新增 ==="
-          git --no-pager log --oneline HEAD..upstream/main | head -20
-
-          if ! git rebase upstream/main; then
-            echo "::error::上游改动和我们的提交冲突，自动变基失败。"
-            echo "::error::本地：git fetch upstream && git rebase upstream/main，解决后 push 到 custom。"
-            git rebase --abort
-            exit 1
-          fi
-
-          git push origin HEAD:custom
-          echo "updated=true" >> "$GITHUB_OUTPUT"
-
   build:
-    name: 构建并发布
-    needs: sync
-    # 推代码 / 手动触发一律构建；定时任务只在真有上游更新时构建
-    if: |
-      needs.sync.outputs.updated == 'true' ||
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch'
+    name: 构建 Windows 安装包
+    if: github.event_name == 'workflow_dispatch' || github.event.created == true
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: custom
+          persist-credentials: false
+
+      - name: 核对版本标签
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -cne $version) {
+            throw "版本标签 $env:GITHUB_REF_NAME 必须与 package.json 的 $version 一致"
+          }
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
-      # electron 的二进制缓存：Windows 上是 %LOCALAPPDATA%\electron\Cache
       - uses: actions/cache@v4
         with:
           path: |
@@ -113,58 +46,60 @@ jobs:
             ~/.cache/electron
           key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
-      - name: 装依赖
+      - name: 安装依赖
         run: npm ci
 
-      - name: 构建渲染层
+      - name: 构建应用
         run: npm run build
 
-      # --publish always：把安装包、latest.yml、blockmap 发到 REPO_OWNER/REPO_NAME。
-      # tag 不带 v 前缀（vPrefixedTagName=false）：fork 里带着上游的 v2.7.12 tag，
-      # 用 2.7.12 可以避开它，release 才不会挂到上游那个 commit 上。
-      - name: 打包并发布
+      - name: 打包 Windows x64
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          $argv = @(
-            '--win',
-            '--publish', 'always',
-            "-c.publish.provider=github",
+          $builderArgs = @(
+            '--win', '--x64',
+            '--publish', 'never',
+            '-c.publish.provider=github',
             "-c.publish.owner=$env:REPO_OWNER",
             "-c.publish.repo=$env:REPO_NAME",
-            '-c.publish.releaseType=release',
             '-c.publish.vPrefixedTagName=false'
           )
-          npx electron-builder @argv
+          npx electron-builder @builderArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: 打包结果
-        shell: pwsh
-        run: |
-          Get-ChildItem release -File | Where-Object { $_.Extension -in '.exe', '.zip', '.yml', '.blockmap' } |
-            ForEach-Object { Write-Host ("  {0,-46} {1,8:N1} MB" -f $_.Name, ($_.Length / 1MB)) }
+          foreach ($pattern in @('*.exe', '*.exe.blockmap', '*.zip', 'latest.yml')) {
+            if (-not (Get-ChildItem -LiteralPath release -Filter $pattern -File)) {
+              throw "缺少 Windows 产物 $pattern"
+            }
+          }
 
-      # 顺手留一份 artifact：release 下载走的是 Releases 页面，artifact 方便不用翻版本
       - uses: actions/upload-artifact@v4
         with:
           name: ColaMD-win64
           path: |
             release/*.exe
+            release/*.exe.blockmap
             release/*.zip
             release/latest.yml
           retention-days: 30
           if-no-files-found: error
 
-      - name: 摘要
-        if: always()
-        shell: pwsh
-        run: |
-          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          @(
-            "### custom-build",
-            "",
-            "- 版本: ``$version``（跟随上游）",
-            "- 品牌: ColaMD（appId/productName 沿用 electron-builder.yml，不覆盖）",
-            "- 上游同步: ``${{ needs.sync.outputs.updated }}``（落后 ${{ needs.sync.outputs.behind }} 个提交）",
-            "- Release: https://github.com/$env:REPO_OWNER/$env:REPO_NAME/releases/tag/$version"
-          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+  release:
+    name: 发布 Windows Release
+    if: github.event_name == 'push' && github.event.created == true
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ColaMD-win64
+          path: artifacts
+
+      - name: 发布已构建的安装包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

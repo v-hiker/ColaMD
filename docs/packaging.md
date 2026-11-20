@@ -49,6 +49,13 @@ CI 上的 mac job（universal 加签名、公证、dmg 压缩）实测 7 分 20 
 
 这里曾经列了两条优化（`npmRebuild: false`、跳过扩展属性清理），前提是「打包要 6 到 8 分钟」。重新测量后本地打包是**十几秒级**，这个前提不成立，所以不做。先测量再优化，不要凭印象预防性地折腾构建配置。
 
+## 自用 Windows 构建和发布
+
+- 日常提交推送到 custom 分支。
+- 试装时在 Actions 手动运行 custom-build，从 ColaMD-win64 工件下载 Windows x64 安装包。
+- 发版时提高 package.json 和 package-lock.json 的版本，提交后推送与版本号一致的纯数字标签，例如 2.7.13。GitHub 构建并校验 Windows 产物，再将安装包、绿色版和更新清单一起发布到该标签的 Release。
+- custom-sync 每天北京时间 01:37 检查官方最新正式版，将版本标签对应的提交合并进 custom。遇到冲突时在 custom 分支手动合并。
+
 ## 参考
 
 - 发版流程与资产核对清单：`PRINCIPLES.md` 第 9 节
