@@ -15,6 +15,9 @@ import './themes/base.css'
 import './themes/premium.css'
 import './themes/editor-preview.css'
 import './themes/document.css'
+// 本分支自己的排版覆盖（表格网格、标题字重、Wide 档全宽）。必须放在最后，
+// 靠后加载压过前面同权重的规则。文件里说明了为什么不直接改上面那几个。
+import './themes/custom-defaults.css'
 
 let sourceModeActive = false
 // 阅读模式：锁住输入，表格/图片/HTML 块不再因为光标落进去而退回源码。

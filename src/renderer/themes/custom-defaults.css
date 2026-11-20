@@ -1,0 +1,108 @@
+/* ===== 本分支的默认排版覆盖 =====
+ *
+ * 这份文件不属于上游：custom 分支新增，只在 renderer/main.ts 里 import 一次。
+ * 作用是把几处「我这边要固定下来」的排版内置进产品，不再依赖在主题菜单里选一个
+ * 自定义主题（那份主题其实就是把下面这些规则写成 CSS 文件）。
+ *
+ * 为什么不直接改 editor-preview.css / base.css：
+ * 那两个文件上游几乎每个 release 都在动，规则写进去以后每次 rebase 都要处理冲突，
+ * 而 rebase 现在是 CI 自动跑的，一冲突整个构建就停了。这里只多一个文件名，
+ * 上游永远不会碰。
+ *
+ * 选择器一律带 #editor：id 的权重压得过主题里那些 body.theme-* 的类选择器，
+ * 所以表格结构不会被「切到简白/雅致」这类主题改回去。
+ * 颜色一律走主题变量或从 --text-color 派生，所以换深色主题也成立——
+ * 主题管配色，这份只管结构。
+ */
+
+/* ---- 表格：外框 + 竖线 + 表头 ---- */
+
+/* 原样式给整块表格染了 45% 的表头色，又换成等宽字体缩到 0.875em，
+ * 一张表读起来像嵌进文档里的一块灰盒子。 */
+#editor .cm-content .cm-md-table {
+  background: transparent;
+  font-family: inherit;
+  font-size: 1em;
+}
+
+#editor .cm-content .cm-md-table-widget {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  margin: 0.2em 0 0.7em;
+}
+
+#editor .cm-content .cm-md-table-widget th,
+#editor .cm-content .cm-md-table-widget td {
+  border: 1px solid var(--border-color);
+  padding: 7px 11px;
+  vertical-align: top;
+  line-height: 1.65;
+}
+
+#editor .cm-content .cm-md-table-widget th {
+  background: color-mix(in srgb, var(--text-color) 4%, var(--bg-color));
+  font-weight: 600;
+  white-space: nowrap;
+  border-bottom-color: color-mix(in srgb, var(--text-color) 22%, var(--border-color));
+}
+
+/* 第一列给一个下限：不给的话「核心解决痛点」会被压成竖排的单字。 */
+#editor .cm-content .cm-md-table-widget th:first-child,
+#editor .cm-content .cm-md-table-widget td:first-child {
+  white-space: normal;
+  min-width: 5.5em;
+}
+
+/* 格子里的行内代码跟着表格字号走，别在 1em 的表里缩成正文那个 0.875em。 */
+#editor .cm-content .cm-md-table-widget code {
+  font-size: 0.94em;
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  background: var(--code-bg);
+  font-family: var(--font-mono, monospace);
+}
+
+/* ---- 标题：600 而不是 700 ---- */
+
+/* 中文 700 在 16px 上容易糊成一团，600 清晰得多；下划线也压淡一档，别抢正文。 */
+#editor .cm-content .cm-md-atxheading1,
+#editor .cm-content .cm-md-atxheading2,
+#editor .cm-content .cm-md-atxheading3 {
+  font-weight: 600;
+}
+
+#editor .cm-content .cm-md-atxheading1,
+#editor .cm-content .cm-md-atxheading2 {
+  border-bottom-color: color-mix(in srgb, var(--text-color) 14%, transparent);
+}
+
+/* ---- 行内代码：底色跟着文字色派生 ---- */
+
+#editor .cm-content .cm-md-inlinecode {
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--text-color) 7%, transparent);
+  letter-spacing: 0.01em;
+}
+
+/* ---- 独占一行的图片居中 ---- */
+
+/* 原样式是 inline-block，宽度不足列宽的图贴在左边、右边空一片。
+ * 只补居中，不动 max-width（只缩不放要留着）。 */
+#editor .cm-content .cm-line:has(> .cm-md-image) {
+  text-align: center;
+}
+
+#editor .cm-content .cm-md-image {
+  margin: 0.35em 0;
+}
+
+/* ---- Wide 档跟随窗口 ---- */
+
+/* 上游三档是固定值（窄 640 / 标准 780 / 宽 1080），窗口拉到 2560 正文也只有一条。
+ * 只改 Wide 这一档，其余两档保持上游的样子：需要全宽时在 View > Text Width 选 Wide，
+ * 选择会记在 localStorage 里，之后打开都是它。 */
+body.page-width-wide {
+  --editor-column-width: min(1680px, calc(100vw - 96px));
+}
