@@ -96,21 +96,28 @@ jobs:
 
       # --publish never 是必须的：electron-builder.yml 里的 publish 指向
       # marswaveai/ColaMD，不加这个会把产物往上游的 release 发（而且没权限）。
-      - name: 打包（zip 绿色版）
-        run: npx electron-builder --win zip --publish never
+      # 目标不写死：按 electron-builder.yml 的 win.target 走，即 nsis 安装包 + zip 绿色版。
+      - name: 打包（安装包 + 绿色版）
+        run: npx electron-builder --win --publish never
 
       - name: 改名带 sha
         shell: pwsh
         run: |
           $short = "${{ github.sha }}".Substring(0, 7)
+          Get-ChildItem release -Filter *.exe | Where-Object { $_.Name -like 'ColaMD-Setup-*' } | ForEach-Object {
+            Rename-Item $_.FullName "ColaMD-custom-$short-Setup.exe"
+            Write-Host "-> ColaMD-custom-$short-Setup.exe"
+          }
           Get-ChildItem release -Filter *.zip | ForEach-Object {
             Rename-Item $_.FullName "ColaMD-custom-$short-win64.zip"
-            Write-Host "-> $($_.Name)"
+            Write-Host "-> ColaMD-custom-$short-win64.zip"
           }
 
       - uses: actions/upload-artifact@v4
         with:
           name: ColaMD-custom-win64
-          path: release/ColaMD-custom-*-win64.zip
+          path: |
+            release/ColaMD-custom-*-Setup.exe
+            release/ColaMD-custom-*-win64.zip
           retention-days: 30
           if-no-files-found: error
