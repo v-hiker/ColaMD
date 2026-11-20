@@ -1,0 +1,116 @@
+# 自己的构建流水线：把上游更新合进 custom，然后打一个 Windows 绿色版。
+#
+# 为什么不复用上游的 release.yml：那个跑三平台 + macOS 签名公证，需要证书，
+# 而且 publish 指向 marswaveai/ColaMD —— 在 fork 上跑会试图往上游发 release。
+#
+# 这里只做一件事：windows-latest 上出 zip（解压即用的绿色版），丢进 Actions
+# artifact。版本号沿用 package.json，文件名另加 commit 短 sha，避免和上游的
+# ColaMD-<version>-win-x64.zip 混在一起。
+
+name: custom-build
+
+on:
+  push:
+    branches: [custom]
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 17:37（北京时间 01:37）检查一次上游，有更新就同步并构建。
+    - cron: '37 17 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: custom-build
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 合并上游
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.rebase.outputs.updated }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: Rebase onto upstream/main
+        id: rebase
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/marswaveai/ColaMD.git
+          git fetch upstream main --tags
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "上游没有新提交，跳过。"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "上游新增："
+          git --no-pager log --oneline HEAD..upstream/main | head -20
+
+          if ! git rebase upstream/main; then
+            echo "::error::上游改动和我们的提交冲突，自动变基失败。"
+            echo "::error::本地执行：git fetch upstream && git rebase upstream/main，解决后 push 到 custom。"
+            git rebase --abort
+            exit 1
+          fi
+
+          git push origin HEAD:custom
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: 构建 Windows 绿色版
+    needs: sync
+    # 定时触发的 run 只在真有上游更新时构建；手动和 push 触发一律构建。
+    if: needs.sync.outputs.updated == 'true' || github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: custom
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # electron 的二进制缓存：Windows 上是 %LOCALAPPDATA%\electron\Cache
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: 装依赖
+        run: npm ci
+
+      - name: 构建渲染层
+        run: npm run build
+
+      # --publish never 是必须的：electron-builder.yml 里的 publish 指向
+      # marswaveai/ColaMD，不加这个会把产物往上游的 release 发（而且没权限）。
+      - name: 打包（zip 绿色版）
+        run: npx electron-builder --win zip --publish never
+
+      - name: 改名带 sha
+        shell: pwsh
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          Get-ChildItem release -Filter *.zip | ForEach-Object {
+            Rename-Item $_.FullName "ColaMD-custom-$short-win64.zip"
+            Write-Host "-> $($_.Name)"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ColaMD-custom-win64
+          path: release/ColaMD-custom-*-win64.zip
+          retention-days: 30
+          if-no-files-found: error
