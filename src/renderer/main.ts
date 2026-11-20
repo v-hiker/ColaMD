@@ -1152,6 +1152,33 @@ function toggleReadingMode(): void {
   applyReadingMode(!readingModeActive)
 }
 
+/**
+ * 把图片本体写进剪贴板（右键菜单的「复制图片」）。
+ *
+ * 走 canvas 而不是 fetch：本地图片是 file:// URL，fetch 会被 CORS 拦，
+ * 而已经画出来的 <img> 通过 canvas 重新编码成 PNG 不受这个限制。
+ * toBlob 之后交给 navigator.clipboard.write —— 这是 W3C 的标准写法，
+ * 不依赖主进程那边（Electron 44 的 clipboard 已经没有 writeImage 了）。
+ */
+async function copyImageToClipboard(src: string): Promise<void> {
+  try {
+    const image = new Image()
+    image.src = src
+    await image.decode()
+    const canvas = document.createElement('canvas')
+    canvas.width = image.naturalWidth
+    canvas.height = image.naturalHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(image, 0, 0)
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
+    if (!blob) return
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+  } catch {
+    /* 远程图、坏图或没有剪贴板权限：当没点过，不弹错误框 */
+  }
+}
+
 function cancelPendingPanelHide(): void {
   panelHideCleanup?.()
   panelHideCleanup = null
@@ -2065,6 +2092,8 @@ async function init(): Promise<void> {
       }
     } else if (action === 'open-image' && value) {
       openImageOverlay(value)
+    } else if (action === 'copy-image' && value) {
+      void copyImageToClipboard(value)
     }
   })
   // Source-mode edits update the word count and mark the doc dirty in real time

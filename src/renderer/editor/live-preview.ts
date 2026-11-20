@@ -338,10 +338,16 @@ function withSourceRange<T extends HTMLElement>(el: T, from: number, to: number)
  * 光是不可见的 DOM 就够呛。
  */
 let imageOverlay: HTMLDivElement | null = null
+/** 灯箱里的缩放比例，滚轮改它，双击在 1x/2x 之间切。 */
+let overlayScale = 1
 
 /** 右键菜单里的「查看原图」从这里进来（主进程那侧只能发一个 src 回来）。 */
 export function openImageOverlay(src: string, alt = ''): void {
   showImageOverlay(src, alt)
+}
+
+function applyOverlayScale(img: HTMLImageElement): void {
+  img.style.transform = overlayScale === 1 ? '' : `scale(${overlayScale})`
 }
 
 function showImageOverlay(src: string, alt: string): void {
@@ -366,12 +372,35 @@ function showImageOverlay(src: string, alt: string): void {
       event.stopPropagation()
     }, true)
   }
+
   const img = imageOverlay.querySelector('img') as HTMLImageElement
   const caption = imageOverlay.querySelector('.cm-image-overlay-caption') as HTMLElement
+
+  if (!img.dataset.bound) {
+    img.dataset.bound = '1'
+    // 滚轮缩放。被动监听拦不住页面滚动，这里必须 preventDefault。
+    img.addEventListener('wheel', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const next = event.deltaY > 0 ? overlayScale / 1.15 : overlayScale * 1.15
+      overlayScale = Math.min(8, Math.max(0.15, next))
+      applyOverlayScale(img)
+    }, { passive: false })
+    // 双击在 1x / 2x 之间切；点图片本身不该关掉遮罩，所以停掉冒泡。
+    img.addEventListener('dblclick', (event) => {
+      event.stopPropagation()
+      overlayScale = overlayScale === 1 ? 2 : 1
+      applyOverlayScale(img)
+    })
+    img.addEventListener('click', (event) => event.stopPropagation())
+  }
+
+  overlayScale = 1
+  applyOverlayScale(img)
   img.src = src
   img.alt = alt
-  caption.textContent = alt
-  caption.hidden = alt.trim() === ''
+  caption.textContent = alt.trim() === '' ? '滚轮缩放 · 双击看细节 · 点空白处关闭' : alt
+  caption.hidden = false
   imageOverlay.classList.add('open')
 }
 

@@ -805,6 +805,14 @@ body.theme-notion .cm-content .cm-md-url {
   object-fit: contain;
   border-radius: 6px;
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  /* 滚轮缩放走 transform，不触发重排；缩放后超出视口的交给外层 overflow 裁。 */
+  transition: transform 0.12s ease-out;
+  transform-origin: center center;
+  cursor: zoom-in;
+}
+
+.cm-image-overlay.open {
+  overflow: hidden;
 }
 
 .cm-image-overlay-caption {

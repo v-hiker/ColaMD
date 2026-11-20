@@ -854,6 +854,14 @@ function copyToClipboard(text: string): void {
   void write?.catch((err: unknown) => { console.error('clipboard write failed:', err) })
 }
 
+/**
+ * 把图片本体写进剪贴板（右键菜单的「复制图片」）。
+ *
+ * 真正的写入在渲染进程（canvas + navigator.clipboard）：Electron 44 的
+ * clipboard 已经改成 W3C 风格，只剩 write(ClipboardItem[]) / writeText，
+ * 没有 writeImage，主进程这边塞一个 Blob 进去反而更绕。
+ */
+
 function fileManagerName(): 'finder' | 'explorer' | 'file-manager' {
   if (process.platform === 'darwin') return 'finder'
   if (process.platform === 'win32') return 'explorer'
@@ -931,6 +939,12 @@ ipcMain.handle('editor-context-menu', (event, payload: unknown) => {
   }
   if (typeof image === 'string' && image !== '') {
     if (items.length > 0) items.push({ type: 'separator' })
+    // 复制图片本体而不是地址：贴到聊天窗口/文档里直接就是图。
+    // 真正的写入在渲染进程做（那边有 canvas 与 navigator.clipboard），这里只转发。
+    items.push({
+      label: zh ? '复制图片' : 'Copy Image',
+      click: () => win.webContents.send('editor-menu-action', 'copy-image', image)
+    })
     items.push({ label: zh ? '复制图片地址' : 'Copy Image Address', click: () => copyToClipboard(image) })
     items.push({
       label: zh ? '查看原图' : 'View Full Image',

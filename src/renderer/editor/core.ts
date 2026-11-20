@@ -9,11 +9,11 @@
 // 这一层需要 DOM（EditorView 要做布局测量）。不依赖 DOM 的那一半在 state.ts 里，
 // 验收脚本直接消费那一半，所以保真的证明不需要真实浏览器。
 
-import { EditorState, RangeSet } from '@codemirror/state'
+import { EditorState, RangeSet, type Extension } from '@codemirror/state'
 import { EditorView, drawSelection, dropCursor, highlightSpecialChars, rectangularSelection, crosshairCursor, Decoration } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import { undo, redo } from '@codemirror/commands'
-import { livePreview, setEditorFocus, setMeasureHost } from './live-preview'
+import { livePreview, setEditorFocus, setMeasureHost, readingModeField } from './live-preview'
 import { listInput } from './list-input'
 import { searchHighlightField } from './search-highlight'
 import { stateExtensions, editableCompartment, bodyStart } from './state'
@@ -89,6 +89,47 @@ const taskMarkerAtomicRanges = EditorView.atomicRanges.of((view) => {
 
 const ATOMIC_MARK = Decoration.replace({})
 
+/**
+ * 「可编辑 / 只读」这套配置。
+ *
+ * 只读时 CM6 的 editable facet 必须是 false —— 只有它关掉，CM6 才不接管选区
+ * （否则它会把用户拖选出来的 DOM 选区同步回自己的 selection，选区立刻塌掉，
+ * 复制出来的是表格源码 `| 维度 | 说明 |`）。
+ *
+ * 但 contenteditable 属性不能跟着变成 false：Chromium 里那样的区域连鼠标拖选
+ * 都不允许开始（实测 rangeCount 0）。所以属性那一层单独在 keepSelectableWhenReadOnly
+ * 里钉住，facet 和 DOM 属性在这里拆成两件事。
+ */
+function editabilityExtensions(editable: boolean): Extension {
+  return [
+    EditorView.editable.of(editable),
+    EditorState.readOnly.of(!editable),
+    EditorState.changeFilter.of((tr) => editable || !tr.docChanged),
+  ]
+}
+
+/**
+ * 只读期间把 DOM 的 contenteditable 属性钉成 true，让浏览器肯从正文里开始拖选。
+ *
+ * CM6 每次 update 之后会按 editable facet 重设这个属性，所以用 MutationObserver
+ * 盯着，改回去就再改回来。
+ */
+let contentEditableGuard: MutationObserver | null = null
+
+function keepSelectableWhenReadOnly(view: EditorView, readOnly: boolean): void {
+  contentEditableGuard?.disconnect()
+  contentEditableGuard = null
+  if (!readOnly) return
+  const force = (): void => {
+    if (view.contentDOM.getAttribute('contenteditable') !== 'true') {
+      view.contentDOM.setAttribute('contenteditable', 'true')
+    }
+  }
+  force()
+  contentEditableGuard = new MutationObserver(force)
+  contentEditableGuard.observe(view.contentDOM, { attributes: true, attributeFilter: ['contenteditable'] })
+}
+
 export function createEditorCore(parent: HTMLElement, options: EditorOptions = {}): EditorHandle {
   const changeListener = options.onChange
 
@@ -145,7 +186,7 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
     // `[ ]` 两个方框之间那一格里：左右键要一格一格挪过去，停在里面打字又把
     // `- [ ]` 敲成 `- [x]` 之类的残骸（#164）。声明成原子区间后，光标一次跨过它。
     taskMarkerAtomicRanges,
-    editableCompartment.of(EditorView.editable.of(options.editable ?? true)),
+    editableCompartment.of(editabilityExtensions(options.editable ?? true)),
     // 文档变化的唯一出口：把新文本交给外壳
     EditorView.updateListener.of((update) => {
       if (update.docChanged && changeListener) {
@@ -160,6 +201,21 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
   })
   // 异步画完的图会改块高，widget 拿不到 view，由这里记一份（见 live-preview 的 remeasureAfterDraw）
   setMeasureHost(view)
+
+  // 阅读态下，widget（表格、图片、mermaid、块公式）里的 mousedown 不要被编辑器接管。
+  //
+  // CM6 的 mousedown 会 preventDefault 来自己摆光标，浏览器于是不会开始原生选择：
+  // 拖选一张表，选区压根建不起来（实测 rangeCount 0），后面 copy 再怎么补救都没用。
+  // 阅读模式没有光标要摆，这一下放行给浏览器，拖选才有内容可复制。
+  //
+  // 用 capture 阶段：CM6 的内置 handlers 注册在同一个节点的冒泡阶段，比这里晚。
+  view.contentDOM.addEventListener('mousedown', (event) => {
+    if (!(view.state.field(readingModeField, false) ?? false)) return
+    const target = event.target as HTMLElement | null
+    if (target?.closest('.cm-md-table-widget, .cm-md-image, .cm-md-mermaid, .cm-md-math-block')) {
+      event.stopPropagation()
+    }
+  }, true)
 
   // 创建时就已经带焦点的编辑器不会触发 focus 事件（它一直是焦点），这里补一次初始值。
   // 不做这一步，用户一打开文件就打字，标记却不会显形。
@@ -190,12 +246,15 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
 
     focus: () => view.focus(),
     setEditable(editable: boolean): void {
-      view.dispatch({ effects: editableCompartment.reconfigure(EditorView.editable.of(editable)) })
+      view.dispatch({ effects: editableCompartment.reconfigure(editabilityExtensions(editable)) })
+      keepSelectableWhenReadOnly(view, !editable)
     },
     undo: () => { undo(view) },
     redo: () => { redo(view) },
     getView: () => view,
     destroy(): void {
+      contentEditableGuard?.disconnect()
+      contentEditableGuard = null
       setMeasureHost(null)
       view.destroy()
       handle = null
