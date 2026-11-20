@@ -36,12 +36,12 @@ concurrency:
 env:
   APP_ID: ai.marswave.colamd.custom
   APP_NAME: ColaMD Custom
-  # userData 目录名。electron-builder.yml 里的 productName 不会写进打包后的
-  # package.json（实测：productName 字段是空的），Electron 的 app.getName() 于是
-  # 回落到 name —— 也就是 colamd。两个版本共用 %APPDATA%\colamd 的话，Chromium 的
-  # profile 锁、localStorage、窗口状态、更新检查时间戳全挤在一处，同时开两个会打架。
-  # extraMetadata.name 是唯一能改到 package.json 的开关（顺带让更新缓存目录也分开）。
-  APP_CACHE_NAME: colamd-custom
+  # 注意这里**没有** extraMetadata.name：userData 故意跟官方版共用 %APPDATA%\colamd。
+  # 打包后的 package.json 里没有 productName（electron-builder.yml 那个不会写进去），
+  # app.getName() 回落到 name=colamd，于是两版共用同一份 profile——换过来装的时候
+  # 语言、窗口位置、主题选择、面板宽度全都还在，不用重配。
+  # 代价：两个 app 指向同一份 Chromium profile，同时开着会互相抢（单例锁），
+  # 装好这版之后就别再开官方版了。
   REPO_OWNER: ${{ github.repository_owner }}
   REPO_NAME: ${{ github.event.repository.name }}
 
@@ -136,7 +136,6 @@ jobs:
             '--publish', 'always',
             "-c.appId=$env:APP_ID",
             "-c.productName=$env:APP_NAME",
-            "-c.extraMetadata.name=$env:APP_CACHE_NAME",
             "-c.publish.provider=github",
             "-c.publish.owner=$env:REPO_OWNER",
             "-c.publish.repo=$env:REPO_NAME",
