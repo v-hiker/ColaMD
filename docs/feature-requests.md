@@ -52,9 +52,19 @@ The reading toggle applies to both rendered and source views, so readers can ins
 
 Rendered text tables can give a column slightly more width when doing so reduces wrapping across the whole table. The layout uses measured text widths and updates as the available width changes.
 
+### Edit a rendered table cell in place
+
+Click a cell to edit its text inside the table. Enter or clicking elsewhere confirms, Tab confirms and advances, and Escape cancels. A confirmed edit is a single undo step. Use source mode to change rows, columns, or alignment.
+
 ### Emphasis next to CJK punctuation
 
 The editor recognizes asterisk emphasis around a CJK quotation directly following text, and after a CJK closing bracket or quotation mark directly followed by text.
+
+### Markdown escapes in exported documents
+
+The rendered text and outline decode Markdown escapes and character references used in exports such as Feishu's Markdown. The source editor and code spans and blocks show literal text.
+
+Tables share the document's inline Markdown parser for escapes, nested formatting and code. Setext headings appear in the editor and outline and export at their original level. Inline link destinations resolve escaped punctuation and character references.
 
 ## Implemented On Main
 
@@ -319,9 +329,7 @@ LLM 生成的 Markdown 常常在段落之间留一串空行，读起来松垮。
 
 A rendered block (table, diagram, image, formula, raw HTML) is a replacement widget, so its own text never enters the selection model: dragging across a rendered table selects nothing, and the same holds for a diagram's labels.
 
-2026-10-15 changed what a click does (#153): block widgets reveal their Markdown while the caret is inside, and clicking a table cell lands the caret in that cell of the source (`isBlockActive` in `live-preview.ts`, `tableCellAnchor` in `editor.ts`). The reported problem, that typing after clicking a table destroyed it, is gone with that.
-
-Still open: editing and selecting text inside the rendered block itself, without stepping into the source. The document is text and rendering is a layer of decoration over it (`docs/editor-architecture.md`), so that is a structural change rather than a styling fix: the rendered table would have to stay real text, with the pipes hidden and the cells padded so the columns line up. Undecided.
+The custom branch supports editing a rendered table cell in place and selecting table text in reading mode. Selection in the other rendered widgets remains a separate request.
 
 ### XDG data directories on Linux (#142)
 

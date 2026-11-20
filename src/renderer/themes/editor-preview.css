@@ -114,6 +114,15 @@
   padding-top: 1em;
 }
 
+.cm-content .cm-line[data-setext-heading] + .cm-line[data-setext-heading] {
+  padding-top: 0;
+}
+
+.cm-content .cm-line[data-setext-heading]:has(+ .cm-line[data-setext-heading]) {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
 /* 标记字符（#、>、-、围栏、*）：光标不在这一行时压淡。 */
 .cm-content .cm-md-marker,
 .cm-content .cm-md-quotemark,
@@ -780,6 +789,18 @@ body.theme-notion .cm-content .cm-md-url {
 .cm-content .cm-md-frontmatter-folded {
   height: 0;
   line-height: 0;
+}
+
+.cm-content .cm-line.cm-md-heading-underline {
+  height: 0;
+  line-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.cm-content .cm-md-heading-underline::before {
+  display: none;
 }
 
 /* ======= 图片灯箱 ======= */

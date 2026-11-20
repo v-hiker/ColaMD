@@ -267,6 +267,105 @@ try {
     check(name + '切换不改磁盘字节或mtime', readFileSync(path, 'utf8') === text && statSync(path).mtimeMs === mtime)
   }
 
+  const escapedText = [
+    '# 1\\.1 S\\&OP&#x20;计划 **说明** `&amp;`',
+    '',
+    'S\\&OP&#x20;计划 &lt;em&gt; \\&amp; &amp;#x20; &unknown;',
+    '',
+    '1\\. 普通编号，\\*字面星号\\*',
+    '',
+    '`S\\&OP &#x20;`',
+    '',
+    '```js',
+    'const example = "\\&amp; &#x20;";',
+    '```',
+  ].join('\n')
+  const escapedFile = join(runtime, 'markdown-escapes.md')
+  writeFileSync(escapedFile, escapedText)
+  const escapedMtime = statSync(escapedFile).mtimeMs
+  await openFixture(escapedFile, escapedText)
+  const escapedRender = await evaluate(`(() => {
+    if (document.getElementById('file-panel').hidden) document.getElementById('file-toggle-btn').click()
+    document.getElementById('file-panel-outline').click()
+    return {
+      heading: v.contentDOM.querySelector('.cm-md-atxheading1')?.textContent,
+      lines: [...v.contentDOM.querySelectorAll('.cm-line')].map(line => line.textContent),
+      outline: document.querySelector('#outline-list button')?.textContent,
+      numberedList: !!v.contentDOM.querySelector('.cm-md-li'),
+      decodedAsHTML: !!v.contentDOM.querySelector('em'),
+    }
+  })()`)
+  const headingLabel = '1.1 S&OP 计划 说明 &amp;'
+  check('标题与大纲还原转义和字符引用，保留行内代码', escapedRender.heading === headingLabel && escapedRender.outline === headingLabel, escapedRender)
+  check('正文只解码一层，字符引用仍为文本',
+    escapedRender.lines.includes('S&OP 计划 <em> &amp; &#x20; &unknown;') && !escapedRender.decodedAsHTML, escapedRender)
+  check('转义标点显示为普通文字', escapedRender.lines.includes('1. 普通编号，*字面星号*') && !escapedRender.numberedList, escapedRender)
+  check('行内代码与语言围栏显示字面文本',
+    escapedRender.lines.includes('S\\&OP &#x20;') && escapedRender.lines.includes('const example = "\\&amp; &#x20;";'), escapedRender)
+  await toggle('source', 0)
+  check('源码保留转义且磁盘字节与mtime不变',
+    await evaluate('document.getElementById("source-editor").value') === escapedText &&
+      readFileSync(escapedFile, 'utf8') === escapedText && statSync(escapedFile).mtimeMs === escapedMtime)
+  check('源码模式下的大纲也显示解码后的标题',
+    await evaluate('document.querySelector("#outline-list button")?.textContent') === headingLabel)
+  await evaluate(`document.getElementById('file-panel-files').click(); document.getElementById('file-toggle-btn').click()`)
+
+  const compatibilityText = [
+    '---', 'title: 文档属性', '---', '',
+    '第一节', '======', '',
+    '第二节 &amp;', '接下一行', '-------', '',
+    '[打开页面](<https://example.com/read?a=1&amp;b=2> "页面") [纯文字](javascript&#58;alert%281%29)', '',
+    '| S\\&OP&#x20;计划 | 内容 |', '| --- | --- |',
+    '| **甲\\*乙\\* &lt;b&gt;** | `` a ` b\\|c &amp; `` |',
+    '| ***嵌套强调*** <br> $x_1$ | [页面](<https://example.com/read?a=1&amp;b=2> "链接") |', '',
+    '```md', '# 围栏中的文字', '看起来像标题', '-----', '```', '',
+    '   ### 缩进行首标题', '',
+  ].join('\n')
+  const compatibilityFile = join(runtime, 'markdown-compatibility.md')
+  writeFileSync(compatibilityFile, compatibilityText)
+  const compatibilityMtime = statSync(compatibilityFile).mtimeMs
+  await openFixture(compatibilityFile, compatibilityText)
+  const compatibility = await evaluate(`(() => {
+    if (document.getElementById('file-panel').hidden) document.getElementById('file-toggle-btn').click()
+    document.getElementById('file-panel-outline').click()
+    const content = v.contentDOM
+    const table = content.querySelector('.cm-md-table-widget')
+    const html = window.__colamdExportDocumentHTML()
+    const exported = new DOMParser().parseFromString(html, 'text/html')
+    return {
+      outline: [...document.querySelectorAll('#outline-list button')].map(row => row.textContent),
+      headings: [...exported.querySelectorAll('h1,h2,h3')].map(heading => [heading.tagName, heading.textContent.trim()]),
+      underlines: [...content.querySelectorAll('.cm-md-heading-underline')].map(line => line.getBoundingClientRect().height),
+      bodyHrefs: [...content.querySelectorAll('.cm-md-link[data-href]')].map(link => link.dataset.href),
+      unsafeHref: !!exported.querySelector('a[href^="javascript:"]'),
+      header: table?.querySelector('th')?.textContent,
+      strong: table?.querySelector('strong')?.textContent,
+      code: table?.querySelector('code')?.textContent,
+      nested: table?.querySelector('em strong')?.textContent,
+      math: !!table?.querySelector('.katex'),
+      lineBreak: !!table?.querySelector('br'),
+      tableHref: table?.querySelector('a')?.getAttribute('href'),
+    }
+  })()`)
+  const headingLabels = ['第一节', '第二节 & 接下一行', '缩进行首标题']
+  check('下划线标题进入大纲，围栏和文档属性不算标题',
+    JSON.stringify(compatibility.outline) === JSON.stringify(headingLabels), compatibility)
+  check('下划线在渲染中折叠，多行标题整体导出',
+    JSON.stringify(compatibility.underlines) === '[0,0]' &&
+    JSON.stringify(compatibility.headings) === JSON.stringify(headingLabels.map((label, index) => ['H' + (index + 1), label])), compatibility)
+  check('表格转义、实体、嵌套强调和多反引号代码按 Markdown 显示',
+    compatibility.header === 'S&OP 计划' && compatibility.strong === '甲*乙* <b>' &&
+    compatibility.code === 'a ` b|c &amp;' && compatibility.nested === '嵌套强调', compatibility)
+  check('表格的公式和换行保持可用', compatibility.math && compatibility.lineBreak, compatibility)
+  const compatibilityHref = 'https://example.com/read?a=1&b=2'
+  check('正文和格内链接解码地址实体，危险协议没有生成链接',
+    compatibility.bodyHrefs.includes(compatibilityHref) && compatibility.tableHref === compatibilityHref && !compatibility.unsafeHref, compatibility)
+  await toggle('source', await evaluate('v.state.selection.main.head'))
+  check('通用兼容修复保留文件和源码',
+    await evaluate('document.getElementById("source-editor").value') === compatibilityText &&
+      readFileSync(compatibilityFile, 'utf8') === compatibilityText && statSync(compatibilityFile).mtimeMs === compatibilityMtime)
+  await evaluate(`document.getElementById('file-panel-files').click(); document.getElementById('file-toggle-btn').click()`)
+
   const separatorText = '开头😀\n\n空行后的文字 é\n\n末尾'
   const separatorFile = join(runtime, 'separator.md')
   writeFileSync(separatorFile, separatorText)
@@ -397,19 +496,110 @@ try {
     check(`${theme} 表格原生选区可见`, color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent', color)
   }
   await readingToggle()
-  const cell = await evaluate(`(() => {
+  await evaluate(`(() => {
     getSelection().removeAllRanges()
     document.body.classList.replace('theme-light', ${JSON.stringify(originalTheme ?? 'theme-light')})
-    const r = document.querySelector('.cm-md-table-widget td:nth-child(2)').getBoundingClientRect()
-    return { x: r.left + 16, y: r.top + r.height / 2 }
   })()`)
-  for (const type of ['mousePressed', 'mouseReleased']) {
-    await send('Input.dispatchMouseEvent', { type, ...cell, button: 'left', clickCount: 1 })
+  const clickCell = async (column) => {
+    const cell = await evaluate(`(() => {
+      const r = document.querySelector('.cm-md-table-widget tbody tr').cells[${column}].getBoundingClientRect()
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+    })()`)
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await send('Input.dispatchMouseEvent', { type, ...cell, button: 'left', clickCount: 1 })
+    }
   }
-  check('编辑模式单击仍定位到对应单元格源码', await evaluate(`!document.querySelector('.cm-md-table-widget') && v.state.selection.main.head === ${readingEdited.indexOf(' 单元格乙')}`))
+  const pressEditorKey = async (key, windowsVirtualKeyCode, modifiers = 0) => {
+    const code = key.length === 1 ? 'Key' + key.toUpperCase() : key
+    for (const type of ['rawKeyDown', 'keyUp']) {
+      await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode, modifiers })
+    }
+  }
+  await clickCell(0)
+  await send('Input.insertText', { text: ' | 备注' })
+  check('表格保持渲染，输入即显示在当前格且提交前原文不变', await evaluate(`
+    document.activeElement.matches('.cm-md-table-cell-input') &&
+    document.activeElement.value === '**单元格甲** | 备注' &&
+    document.querySelector('.cm-md-table-widget tbody td:nth-child(2)').textContent === '单元格乙' &&
+    v.state.doc.toString() === ${JSON.stringify(readingEdited)}
+  `))
+  const cellThemes = await evaluate(`(() => {
+    const input = document.activeElement
+    const original = [...document.body.classList].find(name => name.startsWith('theme-'))
+    const colors = []
+    for (const theme of ['light', 'dark']) {
+      if (original) document.body.classList.remove(original)
+      document.body.classList.add('theme-' + theme)
+      const box = input.getBoundingClientRect()
+      const cell = input.parentElement.getBoundingClientRect()
+      colors.push({ background: getComputedStyle(input).backgroundColor, aligned: Math.abs(box.width - cell.width) < 3 })
+      document.body.classList.remove('theme-' + theme)
+    }
+    if (original) document.body.classList.add(original)
+    return colors
+  })()`)
+  check('单元格输入框在浅色和深色主题中贴合网格', cellThemes.every(style => style.aligned) &&
+    cellThemes[0].background !== cellThemes[1].background, cellThemes)
+  await pressEditorKey('Tab', 9)
+  const cellEdited = readingEdited.replace('**单元格甲**', '**单元格甲** \\| 备注')
+  check('Tab 确认后只写回当前格，竖线显示为文字并进入下一格', await evaluate(`
+    v.state.doc.toString() === ${JSON.stringify(cellEdited)} &&
+    document.querySelector('.cm-md-table-widget tbody tr').cells.length === 2 &&
+    document.querySelector('.cm-md-table-widget tbody td').textContent === '单元格甲 | 备注' &&
+    document.activeElement.matches('.cm-md-table-cell-input') && document.activeElement.value === '单元格乙'
+  `))
+  await send('Input.insertText', { text: '放弃的输入' })
+  await pressEditorKey('Escape', 27)
+  check('Esc 取消当前格的输入', await evaluate(`!document.querySelector('.cm-md-table-cell-input') &&
+    v.state.doc.toString() === ${JSON.stringify(cellEdited)}`))
+
+  await clickCell(1)
+  await evaluate(`document.activeElement.select()`)
+  await send('Input.insertText', { text: '**新的说明**' })
+  await pressEditorKey('Enter', 13)
+  const formattedCell = cellEdited.replace('单元格乙', '**新的说明**')
+  check('Enter 确认后渲染当前格的 Markdown 格式', await evaluate(`
+    v.state.doc.toString() === ${JSON.stringify(formattedCell)} &&
+    document.querySelector('.cm-md-table-widget td:nth-child(2) strong')?.textContent === '新的说明'
+  `))
+  await pressEditorKey('z', 90, process.platform === 'darwin' ? 4 : 2)
+  check('撤销只还原最近一次单元格确认', await evaluate(`v.state.doc.toString() === ${JSON.stringify(cellEdited)}`))
+
+  await clickCell(1)
+  await send('Input.insertText', { text: '待确认' })
+  const sourceAfterCell = cellEdited.replace('单元格乙', '单元格乙待确认')
+  const editedCellStart = sourceAfterCell.indexOf('单元格乙待确认')
+  await toggle('source', editedCellStart)
+  check('切到源码前确认单元格并定位该格', await evaluate(`(() => {
+    const source = document.getElementById('source-editor')
+    return source.value === ${JSON.stringify(sourceAfterCell)} && source.selectionStart === ${editedCellStart}
+  })()`))
+  await toggle('render', editedCellStart)
   await readingToggle()
   check('在表格源码内开启阅读模式会恢复表格渲染', await evaluate(`v.state.readOnly && !!document.querySelector('.cm-md-table-widget')`))
   await readingToggle()
+  await evaluate(`v.dispatch({ selection: { anchor: 0 } })`)
+  await clickCell(1)
+  await send('Input.insertText', { text: '点走' })
+  const headingPoint = await evaluate(`(() => {
+    const r = document.querySelector('#editor .cm-md-atxheading1').getBoundingClientRect()
+    return { x: r.left + 16, y: r.top + r.height / 2 }
+  })()`)
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await send('Input.dispatchMouseEvent', { type, ...headingPoint, button: 'left', clickCount: 1 })
+  }
+  const cellAfterBlur = sourceAfterCell.replace('待确认', '待确认点走')
+  check('点到格外确认当前草稿', await evaluate(`!document.querySelector('.cm-md-table-cell-input') &&
+    v.state.doc.toString() === ${JSON.stringify(cellAfterBlur)}`))
+
+  await clickCell(1)
+  await send('Input.insertText', { text: '切标签' })
+  const cellBeforeLeaving = cellAfterBlur.replace('点走', '点走切标签')
+  await evaluate(`document.querySelector('[data-tab-id="'+${JSON.stringify(tabB)}+'"]').click()`)
+  await waitFor(`document.querySelector('.tab-entry.active').dataset.tabId===${JSON.stringify(tabB)} &&
+    v.state.doc.toString()===${JSON.stringify(textB)}`, '切标签前未确认表格内容')
+  check('切标签前确认编辑，并且只保存到原文件', readFileSync(readingFile, 'utf8') === cellBeforeLeaving &&
+    readFileSync(fileB, 'utf8') === textB && statSync(fileB).mtimeMs === mtimeB)
 
   const tableRowsForLayout = [
     ['任务清单输出', '表格只列出每项任务自己的编号、名称和进度，缺少关联信息，还要手工翻查其他记录。', '自动列出当前分组内每项任务的关联记录，并按实际进度输出一份完整清单。'],
@@ -483,7 +673,7 @@ try {
     JSON.stringify(['“无需逐项核对”', '“排序规则见下文”', '斜体']), cjkRendering)
   check('普通强调、行内代码与字面星号继续正常解析', cjkRendering.bold.includes('加粗') &&
     cjkRendering.code.includes('注明*“代码”*') && cjkRendering.text.includes('word*"literal"*word') &&
-    cjkRendering.text.includes('\\*“已转义”\\*'), cjkRendering)
+    cjkRendering.text.includes('*“已转义”*'), cjkRendering)
   check('中文强调预览保留源码及磁盘字节', await evaluate('v.state.doc.toString()') === cjkText && readFileSync(cjkFile, 'utf8') === cjkText)
 
   // 源码位置按真实排版测量，代价随光标前的文字线性增长。用接近整篇源码阈值

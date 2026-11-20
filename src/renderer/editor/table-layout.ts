@@ -15,6 +15,9 @@ function rebalance(table: HTMLTableElement, headers: HTMLTableCellElement[], ava
   const cells = Array.from(table.rows).flatMap((row) => Array.from(row.cells, (cell) => {
     const range = document.createRange()
     range.selectNodeContents(cell)
+    if (cell.lastElementChild?.classList.contains('cm-md-table-cell-input')) {
+      range.setEndBefore(cell.lastElementChild)
+    }
     const style = getComputedStyle(cell)
     const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2
     const inset = parseFloat(style.paddingInlineStart) + parseFloat(style.paddingInlineEnd)

@@ -1,7 +1,8 @@
-import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
+import { createEditor, focusEditor, finishTableCellEdit, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { withDiagramZoomPaused } from './editor/mermaid-bridge'
 import { jumpToSourceLine, sourcePositionTop } from './editor/source-line'
+import { documentHeadings } from './editor/heading-anchor'
 import { EditorView } from '@codemirror/view'
 import { documentHTMLFrom } from './editor/clean-html'
 import { isPresenting, startSlideshow, stopSlideshow } from './slideshow'
@@ -322,6 +323,7 @@ function tabLabel(tab: DocumentTab): string {
 function captureActiveTab(): void {
   const tab = activeTab()
   if (!tab) return
+  finishTableCellEdit()
   // The path is the tab's identity and only changes where a document is really
   // opened or saved; deriving it here would let a stray render rename a tab.
   tab.dirty = dirty
@@ -740,9 +742,12 @@ async function openFileInNewTab(path: string): Promise<void> {
     return
   }
   const current = activeTab()
-  if (current && !current.filePath && !current.dirty) {
-    await window.electronAPI.openSibling(path)
-    return
+  if (current && !current.filePath) {
+    finishTableCellEdit()
+    if (!current.dirty) {
+      await window.electronAPI.openSibling(path)
+      return
+    }
   }
   await openNewTab()
   // Claim the path before the 'file-opened' round-trip lands: a burst of
@@ -938,6 +943,7 @@ async function runAutosave(): Promise<void> {
 }
 
 async function saveCurrent(saveAs = false): Promise<boolean> {
+  finishTableCellEdit()
   const revision = documentRevision
   const content = getFileContent()
   const expectedPath = currentFilePath
@@ -1109,17 +1115,20 @@ function toggleSourceMode(): void {
       })
     }
   } else {
+    const cellPosition = finishTableCellEdit()
     const view = getEditorView()
     const main = view?.state.selection.main
-    const rect = main && view?.coordsAtPos(main.head, main.assoc || 1)
+    const position = cellPosition ?? main?.head
+    const rect = position !== undefined && view ? view.coordsAtPos(position, main?.assoc || 1) : null
     const scroller = editorScroller()
     const fraction = caretViewportFraction(rect ? rect.top - scroller.getBoundingClientRect().top - scroller.clientTop : null, scroller.clientHeight)
     enterSourceMode(getMarkdown())
     // 写入 value 会把光标挪到文末，焦点给了却停在那儿，一打字就跳到底
     const ta = sourceEl()
-    if (main) ta.setSelectionRange(main.from, main.to, main.head < main.anchor ? 'backward' : 'forward')
+    if (cellPosition !== null) ta.setSelectionRange(cellPosition, cellPosition)
+    else if (main) ta.setSelectionRange(main.from, main.to, main.head < main.anchor ? 'backward' : 'forward')
     ta.focus({ preventScroll: true })
-    const head = main?.head ?? ta.selectionEnd
+    const head = position ?? ta.selectionEnd
     const style = getComputedStyle(ta)
     const lineHeight = Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize)
     ta.scrollTop = Math.max(0, sourcePositionTop(ta, head) - caretViewportOffset(fraction, ta.clientHeight, lineHeight))
@@ -1262,38 +1271,13 @@ interface OutlineItem {
   line?: number
 }
 
-function sourceOutline(content: string): OutlineItem[] {
-  const items: OutlineItem[] = []
-  // 代码围栏里的 `#` 是注释，不是标题（#137：Python、shell、YAML 的注释都进过大纲）。
-  // 记一下当前在不在围栏里，以及是哪种围栏、多长：```` 开头的块里出现 ``` 不算闭合。
-  let fence: { char: string; length: number } | null = null
-  content.split(/\r?\n/).forEach((line, index) => {
-    const fenceMatch = /^\s{0,3}(`{3,}|~{3,})/.exec(line)
-    if (fenceMatch) {
-      const marker = fenceMatch[1]
-      if (!fence) {
-        fence = { char: marker[0], length: marker.length }
-      } else if (marker[0] === fence.char && marker.length >= fence.length) {
-        fence = null
-      }
-      return
-    }
-    if (fence) return
-    const match = /^(#{1,6})\s+(.+?)(?:\s+#+)?\s*$/.exec(line)
-    if (!match) return
-    const title = match[2].replace(/!?(?:\[([^\]]*)\])\([^)]*\)/g, '$1').replace(/[*_`]/g, '').trim()
-    if (title) items.push({ level: match[1].length, title, line: index })
-  })
-  return items
-}
-
 // 大纲从源码文本里读，不从渲染后的 DOM 里找。
 //
 // 旧实现是查 `#editor .ProseMirror h1…h6`，因为 ProseMirror 会把标题渲成真的 <h1> 标签。
 // CodeMirror 不这样做：标题只是带上装饰的一行文本。从文本解析本来就更该是对的做法，
 // 它跟「怎么画」无关，读源码模式与视觉模式能用同一份逻辑。
 function visualOutline(): OutlineItem[] {
-  return sourceOutline(getMarkdown())
+  return documentHeadings(getMarkdown())
 }
 
 function outlineVisible(): boolean {
@@ -1306,7 +1290,7 @@ function renderOutline(): void {
   // teardown plus forced layout per frame for output nobody could see.
   if (!outlineVisible()) return
   const list = outlineListEl()
-  outlineItems = sourceModeActive ? sourceOutline(sourceEl().value) : visualOutline()
+  outlineItems = sourceModeActive ? documentHeadings(sourceEl().value) : visualOutline()
   list.innerHTML = ''
   if (outlineItems.length === 0) {
     outlineActiveIndex = -1
@@ -1325,7 +1309,7 @@ function renderOutline(): void {
     button.addEventListener('click', () => {
       // Re-resolve the entry against the live text: cached references die when
       // the editor content is re-set (#64).
-      const current = (sourceModeActive ? sourceOutline(sourceEl().value) : visualOutline())[index]
+      const current = (sourceModeActive ? documentHeadings(sourceEl().value) : visualOutline())[index]
       if (!current) return
       if (sourceModeActive) {
         beginOutlineJump()
@@ -1798,6 +1782,7 @@ function getExportSnapshot(content: string): {
 }
 
 async function exportCurrentHTML(): Promise<void> {
+  finishTableCellEdit()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
@@ -1822,6 +1807,7 @@ async function exportCurrentHTML(): Promise<void> {
 }
 
 async function exportCurrentImage(preset: 'desktop' | 'mobile'): Promise<void> {
+  finishTableCellEdit()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
@@ -1845,6 +1831,7 @@ async function exportCurrentImage(preset: 'desktop' | 'mobile'): Promise<void> {
 // first, or the export would print whatever was on screen before it was typed.
 window.__colamdSlidesExport = {
   enter: async () => {
+    finishTableCellEdit()
     if (sourceModeActive) {
       const content = getContent()
       exitSourceMode()
@@ -1892,6 +1879,7 @@ async function toggleSlideshow(): Promise<void> {
     stopSlideshow()
     return
   }
+  finishTableCellEdit()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
@@ -2066,18 +2054,16 @@ async function init(): Promise<void> {
     event.preventDefault()
     const target = event.target as HTMLElement | null
     const href = target?.closest('a')?.getAttribute('href') ?? ''
-    const selection = sourceModeActive
-      ? (() => {
-          const ta = sourceEl()
-          return ta.value.slice(ta.selectionStart ?? 0, ta.selectionEnd ?? 0)
-        })()
+    const input = sourceModeActive ? sourceEl() : target?.closest<HTMLTextAreaElement>('.cm-md-table-cell-input')
+    const selection = input
+      ? input.value.slice(input.selectionStart, input.selectionEnd)
       : (window.getSelection()?.toString() ?? '')
     void window.electronAPI.showEditorContextMenu({
       selection,
       link: /^https?:/i.test(href) ? href : null,
       image: target instanceof HTMLImageElement ? target.src : null,
       // 阅读态不回传全选：那边全选选中的是文档源码区间，画出来跟看到的内容对不上
-      canSelectAll: !sourceModeActive && !readingModeActive,
+      canSelectAll: !input && !readingModeActive,
     })
   })
   api.onToggleSourceMode(() => toggleSourceMode())
@@ -2136,6 +2122,7 @@ async function init(): Promise<void> {
     // Diagrams are drawn again for the page rather than reused from the screen
     // (src/renderer/editor/mermaid-export.ts), so this awaits a render per
     // diagram before the save dialog opens.
+    finishTableCellEdit()
     const payload = await markdownForWord(getContent(), isChinese())
     await api.exportDOCX(payload)
   })
@@ -2178,6 +2165,7 @@ async function init(): Promise<void> {
     renderTabBar()
   })
   api.onFileChanged((content) => {
+    finishTableCellEdit()
     if (dirty) {
       raiseExternalConflict()
       return

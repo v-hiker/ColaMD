@@ -26,11 +26,15 @@ import { EditorState, RangeSetBuilder, StateEffect, StateField, type Extension }
 import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
+import { decodeString } from 'micromark-util-decode-string'
+import { markdownParser } from './state'
 import { scanMath, excludedRanges, frontmatterRange, type Excluded, type MathRange } from './math-scan'
 import { renderMermaid, attachDiagramZoom, detachDiagramZoom, isDiagramZoomed } from './mermaid-bridge'
-import { sanitizeHTML, cleanStyle } from './html-sanitize'
+import { sanitizeHTML, cleanStyle, isSafeURL } from './html-sanitize'
 import { footnoteDefinitions, footnoteNumbers, FOOTNOTE_REF_RE } from './footnotes'
 import { observeTableLayout, stopObservingTableLayout } from './table-layout'
+import { attachTableRows, displayCellText, readTableSource, type CellSource } from './table-source'
+import { finishRemovedTableEdit } from './table-cell-edit'
 import { isChinese } from '../ui-language'
 
 /** 给区间加样式类，不隐藏任何字符。 */
@@ -861,33 +865,34 @@ function collectFrontmatter(
  * 只加底色的结果是几条彩色横条，不是表格。Obsidian 与 Typora 都是把表格渲染成真表格，
  * 光标进去才回到源码，这里照做。
  *
- * 光标落在表格的任意一行里时退回源码，所以改表格仍然是改文字。
+ * 单元格点击使用原位编辑器。用键盘把正文光标移到表格源码区间时，仍显示源码。
  */
 class TableWidget extends WidgetType {
-  constructor(readonly source: string, readonly base: string | null, readonly from: number, readonly to: number) {
+  constructor(readonly source: string, readonly base: string | null, readonly node: SyntaxNode) {
     super()
   }
 
   eq(other: TableWidget): boolean {
-    return other.source === this.source && other.base === this.base && other.from === this.from && other.to === this.to
+    return other.source === this.source && other.base === this.base &&
+      other.node.from === this.node.from && other.node.to === this.node.to
   }
 
   toDOM(): HTMLElement {
-    const rows = parseTable(this.source)
+    const [head, alignment, ...body] = readTableSource(this.node, this.source)
     const table = document.createElement('table')
     table.className = 'cm-md-table-widget'
-    withSourceRange(table, this.from, this.to)
-    if (rows.length === 0) {
+    withSourceRange(table, this.node.from, this.node.to)
+    if (!head || !alignment) {
       table.textContent = this.source
       return table
     }
-    const [head, , ...body] = rows
+    attachTableRows(table, [head, ...body])
     const thead = document.createElement('thead')
     const headRow = document.createElement('tr')
-    head.forEach((cell, index) => {
+    head.cells.forEach((cell, index) => {
       const th = document.createElement('th')
-      th.style.textAlign = alignOf(rows[1]?.[index] ?? '')
-      appendInline(th, cell, this.base)
+      th.style.textAlign = alignOf(alignment.cells[index]?.text ?? '')
+      appendTableCell(th, cell, this.base)
       headRow.appendChild(th)
     })
     thead.appendChild(headRow)
@@ -895,10 +900,10 @@ class TableWidget extends WidgetType {
     const tbody = document.createElement('tbody')
     for (const row of body) {
       const tr = document.createElement('tr')
-      for (let i = 0; i < head.length; i++) {
+      for (let i = 0; i < head.cells.length; i++) {
         const td = document.createElement('td')
-        td.style.textAlign = alignOf(rows[1]?.[i] ?? '')
-        appendInline(td, row[i] ?? '', this.base)
+        td.style.textAlign = alignOf(alignment.cells[i]?.text ?? '')
+        appendTableCell(td, row.cells[i], this.base)
         tr.appendChild(td)
       }
       tbody.appendChild(tr)
@@ -910,35 +915,8 @@ class TableWidget extends WidgetType {
 
   destroy(dom: HTMLElement): void {
     stopObservingTableLayout(dom)
+    finishRemovedTableEdit(dom)
   }
-}
-
-/** 按行拆表格源码，行内按未转义的 `|` 拆单元格。 */
-function parseTable(source: string): string[][] {
-  return source
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => {
-      const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '')
-      const cells: string[] = []
-      let current = ''
-      for (let i = 0; i < trimmed.length; i++) {
-        const char = trimmed[i]
-        if (char === '\\' && trimmed[i + 1] === '|') {
-          current += '|'
-          i++
-          continue
-        }
-        if (char === '|') {
-          cells.push(current.trim())
-          current = ''
-          continue
-        }
-        current += char
-      }
-      cells.push(current.trim())
-      return cells
-    })
 }
 
 /** 分隔行里的对齐标记：`:---` 左、`:---:` 居中、`---:` 右。 */
@@ -951,134 +929,89 @@ function alignOf(delimiter: string): string {
   return 'left'
 }
 
-/**
- * 单元格里的行内内容。
- *
- * 用 DOM 拼，不拼 innerHTML：单元格内容来自用户的文件，拼字符串等于把文件里的
- * `<img onerror=...>` 直接执行掉。这里只认粗体、斜体、行内代码、删除线、链接、
- * 图片、行内公式和 `<br>`，认不出来的就当普通文字。
- *
- * `<br>` 与图片是 #138 补上的：Obsidian、Typora、GitHub 都把格子里的 `<br/>` 画成
- * 换行，把格子里的 `![](x.png)` 画成图片；2.6 也这样，换内核后这两样都退成了纯文字。
- * 行内 HTML 里只有 `<br>` 被认：它是最常跟表格一起用的一个，而其它标签（尤其是带
- * 事件或样式的）放进表格只会多一个要防的口子。
- *
- * 公式（#197）：判定照旧交给 math-scan.ts（和正文同一套规则），画由 mathElement
- * 负责，格子里的 `$x$` 要画成公式。`$$...$$` 在格子里也按行内画：表格的行高由
- * 单元格决定，一个块级公式会把整行撑开。
- *
- * 下划线强调要卡词边界（#161）。CommonMark 与 GFM 里 `_` 不能跨在词中间生效，
- * 所以 `local_upload / external_api` 是两个普通单词，`snake_case_name` 也一样；
- * 这里早期只写了 `_` 配对，会把中间那段吃掉变成斜体，连下划线本身也不见了。
- * `*` 不受这条限制（`a*b*c` 在 CommonMark 里确实是斜体），所以两个分支分开写。
- * 边界用 Unicode 字母与数字，中文也算词字符。
- */
-const INLINE_RE =
-  /\*\*(?<strong>.+?)\*\*|(?<![\p{L}\p{N}_])__(?<strongU>(?=\S).+?(?<=\S))__(?![\p{L}\p{N}_])|\*(?<em>.+?)\*|(?<![\p{L}\p{N}_])_(?<emU>(?=\S).+?(?<=\S))_(?![\p{L}\p{N}_])|`(?<code>[^`]+)`|~~(?<strike>.+?)~~|!\[(?<alt>[^\]]*)\]\(\s*(?<src><[^>]*>|[^)\s]+)[^)]*\)|\[(?<linkText>[^\]]*)\]\((?<href>[^)]*)\)|<br\s*\/?>/giud
+/** 单元格复用正文的语法树，用文本节点和白名单标签构造 DOM。 */
+function appendTableCell(parent: HTMLElement, cell: CellSource | undefined, base: string | null): void {
+  if (!cell) return
+  const { text, from: start, to: end, syntax } = cell
+  const slice = (from: number, to: number) => text.slice(from - start, to - start)
+  const code = text.includes('$') ? excludedRanges(text, {
+    iterate: ({ enter }) => syntax?.cursor().iterate(node => enter({
+      name: node.name, from: node.from - start, to: node.to - start,
+    })),
+  }) : []
+  const math = scanMath(text, code)
 
-/** 单元格里的行内代码区间：反引号里的 `$` 不是公式定界符。 */
-function codeSpanRanges(text: string): Excluded[] {
-  const out: Excluded[] = []
-  const re = /`[^`]+`/g
-  let match: RegExpExecArray | null
-  while ((match = re.exec(text)) !== null) out.push({ from: match.index, to: match.index + match[0].length })
-  return out
-}
-
-/**
- * 往单元格里写一段源码文字，其中的公式画成 KaTeX。
- *
- * `from` / `to` 是这段文字在整格源码里的下标：强调、链接里的文字也可能带公式，
- * 所以按整格的下标取区间，而不是按切片的局部下标。
- */
-function appendCellText(parent: HTMLElement, text: string, math: MathRange[], from: number, to: number): void {
-  let cursor = from
-  for (const range of math) {
-    // 只处理整段落在这一段里的公式；跨过边界的（`**$x**$` 这类）留着当普通文字
-    if (range.from < cursor || range.to > to) continue
-    if (range.from > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, range.from)))
-    parent.appendChild(mathElement(range.code, false))
-    cursor = range.to
-  }
-  if (cursor < to) parent.appendChild(document.createTextNode(text.slice(cursor, to)))
-}
-
-function appendInline(
-  parent: HTMLElement,
-  text: string,
-  base: string | null,
-  span?: { from: number; to: number },
-): void {
-  // 公式先定出来，免得公式里的 `*`、`_` 被当成强调吃掉
-  const math = scanMath(text, codeSpanRanges(text))
-  const write = (target: HTMLElement, from: number, to: number): void =>
-    appendCellText(target, text, math, from, to)
-
-  // 强调、删除线、链接文字里还可能套着行内代码或另一层强调——真图里最常见的写法
-  // 就是 **`钢梁 v4` / `钢柱 v4`** 这种（2026-11-17 报的「表格里还是原文」）。
-  // 所以这里要能只解析一段区间，并且递归调用自己。
-  // 正则用局部实例：递归会动 lastIndex，共用模块级那一个会让外层从错误位置继续。
-  const re = new RegExp(INLINE_RE.source, INLINE_RE.flags)
-  const start = span?.from ?? 0
-  const stop = span?.to ?? text.length
-  re.lastIndex = start
-  let last = start
-  let match: RegExpExecArray | null
-  while ((match = re.exec(text)) !== null) {
-    // 递归时只认落在这一段里的匹配，跨出边界的留给外层那一圈处理
-    if (match.index >= stop) break
-    const end = match.index + match[0].length
-    if (end > stop) break
-    // 落在公式里的标记只是公式的一部分：`$a*b*c$` 里的 `*b*` 不是斜体。
-    // 跳过它，把整段留到最后按公式画。
-    const index = match.index
-    const inside = math.find((range) => range.from <= index && index < range.to)
-    if (inside) {
-      re.lastIndex = inside.to
-      continue
+  function appendText(target: HTMLElement, from: number, to: number): void {
+    let cursor = from
+    for (const formula of math) {
+      const left = formula.from + start
+      const right = formula.to + start
+      if (left < cursor || right > to) continue
+      target.append(displayCellText(slice(cursor, left)), mathElement(displayCellText(formula.code), false))
+      cursor = right
     }
-    if (match.index > last) write(parent, last, match.index)
-    const g = match.groups ?? {}
-    const at = match.indices?.groups ?? {}
-    if (g.strong !== undefined || g.strongU !== undefined) {
-      const el = document.createElement('strong')
-      const [from, to] = at.strong ?? at.strongU ?? [0, 0]
-      appendInline(el, text, base, { from, to })
-      parent.appendChild(el)
-    } else if (g.em !== undefined || g.emU !== undefined) {
-      const el = document.createElement('em')
-      const [from, to] = at.em ?? at.emU ?? [0, 0]
-      appendInline(el, text, base, { from, to })
-      parent.appendChild(el)
-    } else if (g.code !== undefined) {
-      const el = document.createElement('code')
-      el.textContent = g.code
-      parent.appendChild(el)
-    } else if (g.strike !== undefined) {
-      const el = document.createElement('s')
-      const [from, to] = at.strike ?? [0, 0]
-      appendInline(el, text, base, { from, to })
-      parent.appendChild(el)
-    } else if (g.alt !== undefined) {
-      const img = document.createElement('img')
-      img.src = resolveImageSrc(g.src ?? '', base)
-      img.alt = g.alt
-      parent.appendChild(img)
-    } else if (g.linkText !== undefined) {
-      const el = document.createElement('a')
-      const [from, to] = at.linkText ?? [0, 0]
-      // 空文字的空链接仍然把地址顶上来，否则格子里什么都看不见
-      if (to > from) appendInline(el, text, base, { from, to })
-      else el.textContent = g.href ?? ''
-      const href = (g.href ?? '').trim()
-      if (/^https?:\/\//i.test(href)) el.setAttribute('href', href)
-      parent.appendChild(el)
-    } else if (/^<br/i.test(match[0])) {
-      parent.appendChild(document.createElement('br'))
-    }
-    last = end
+    if (cursor < to) target.append(displayCellText(slice(cursor, to)))
   }
-  if (last < stop) write(parent, last, stop)
+
+  function renderNode(node: SyntaxNode): Node | null {
+    const raw = slice(node.from, node.to)
+    const first = node.firstChild
+    const last = node.lastChild
+    if (node.name === 'Escape' || node.name === 'Entity') return document.createTextNode(decodeString(raw))
+    if (node.name === 'HTMLTag' && /^<br\s*\/?>$/i.test(raw)) return document.createElement('br')
+    if (node.name === 'InlineCode' && first && last) {
+      const element = document.createElement('code')
+      const value = displayCellText(slice(first.to, last.from))
+      element.textContent = value.startsWith(' ') && value.endsWith(' ') && /[^ ]/.test(value) ? value.slice(1, -1) : value
+      return element
+    }
+    if (node.name === 'Link' || node.name === 'Image' || node.name === 'Autolink') {
+      const url = node.getChild('URL')
+      const [open, close] = node.getChildren('LinkMark')
+      if (!url || !open || !close) return null
+      const address = slice(url.from, url.to)
+      const href = node.name === 'Autolink' ? address : decodeDestination(address)
+      if (node.name === 'Image') {
+        const image = document.createElement('img')
+        image.alt = decodeString(slice(open.to, close.from))
+        if (isSafeURL(href)) image.src = resolveImageSrc(href, base)
+        return image
+      }
+      const link = document.createElement('a')
+      if (node.name === 'Autolink' || open.to === close.from) link.textContent = address
+      else appendChildren(link, node, open.to, close.from)
+      if (/^https?:\/\//i.test(href)) link.setAttribute('href', href)
+      return link
+    }
+    const tag = node.name === 'StrongEmphasis' ? 'strong'
+      : node.name === 'Emphasis' ? 'em' : node.name === 'Strikethrough' ? 's' : null
+    if (!tag || !first || !last) return null
+    const element = document.createElement(tag)
+    appendChildren(element, node, first.to, last.from)
+    return element
+  }
+
+  function appendChildren(target: HTMLElement, node: SyntaxNode | undefined, from: number, to: number): void {
+    let cursor = from
+    for (let child = node?.firstChild; child; child = child.nextSibling) {
+      const { from: left, to: right } = child
+      if (left < from || right > to) continue
+      // 公式先占区间，跨越语法节点时不能让强调或转义拆开公式。
+      if (math.some(formula => {
+        const formulaFrom = formula.from + start
+        const formulaTo = formula.to + start
+        return formulaFrom < right && formulaTo > left && (formulaFrom <= left || formulaTo >= right)
+      })) continue
+      const rendered = renderNode(child)
+      if (!rendered) continue
+      appendText(target, cursor, left)
+      target.appendChild(rendered)
+      cursor = right
+    }
+    appendText(target, cursor, to)
+  }
+
+  appendChildren(parent, syntax, start, end)
 }
 
 function collectTables(
@@ -1090,7 +1023,7 @@ function collectTables(
   iterateContent(state, front, (node) => {
       if (node.name !== 'Table') return
       zones.push({ from: node.from, to: node.to, kind: 'block' })
-      // 光标在表格里就退回源码：改表格就是改文字（#153）
+      // 正文光标落在被替换的区间里时显示源码，原位单元格编辑有自己的输入焦点。
       if (isBlockActive(state, node.from, node.to)) {
         pushBlockLines(state, node.from, node.to, 'cm-md-table', ranges)
         return false
@@ -1102,8 +1035,7 @@ function collectTables(
           widget: new TableWidget(
             state.doc.sliceString(node.from, node.to),
             state.field(documentFileUrlField, false) ?? documentFileUrl,
-            node.from,
-            node.to
+            node.node
           )
         }),
       })
@@ -1112,6 +1044,11 @@ function collectTables(
 }
 
 // ─── 链接 ────────────────────────────────────────────────────────────────────
+
+/** 地址里的尖括号是 Markdown 包装，实体和反斜杠按显示地址解码。 */
+function decodeDestination(raw: string): string {
+  return decodeString(raw.startsWith('<') && raw.endsWith('>') ? raw.slice(1, -1) : raw)
+}
 
 /**
  * 链接画成链接。
@@ -1130,18 +1067,16 @@ function collectLinks(state: EditorState, ranges: DecorationRange[], front: Rang
     const url = node.node.getChild('URL')
     if (!url) return false
     if (isActiveRange(state, node.from, node.to)) return false
-    const head = state.doc.sliceString(node.from, url.from)
-    const cut = head.lastIndexOf('](')
-    if (cut < 1) return false
-    const textTo = node.from + cut
+    const [, labelEnd] = node.node.getChildren('LinkMark')
+    const textTo = labelEnd?.from ?? node.from
     if (textTo <= node.from + 1) return false
-    const href = state.doc.sliceString(url.from, url.to)
+    const href = decodeDestination(state.sliceDoc(url.from, url.to))
     ranges.push({ from: node.from, to: node.from + 1, deco: hide(node.from, node.from + 1) })
     ranges.push({ from: textTo, to: node.to, deco: hide(textTo, node.to) })
     ranges.push({
       from: node.from + 1,
       to: textTo,
-      deco: MARK({ class: 'cm-md-link', attributes: { 'data-href': href } }),
+      deco: MARK({ class: 'cm-md-link', attributes: href && isSafeURL(href) ? { 'data-href': href } : {} }),
     })
     return false
   })
@@ -1463,6 +1398,23 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
  */
 const URL_STOP = /[\u2E80-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]/
 
+/** 把解析器认出的转义或字符引用画成文字，光标和文件仍使用源码位置。 */
+class InlineCharacterWidget extends WidgetType {
+  constructor(readonly text: string) {
+    super()
+  }
+
+  eq(other: InlineCharacterWidget): boolean {
+    return other.text === this.text
+  }
+
+  toDOM(): HTMLElement {
+    const span = document.createElement('span')
+    span.textContent = this.text
+    return span
+  }
+}
+
 function collectInline(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
   iterateContent(state, front, (node) => {
       const from = node.from
@@ -1486,6 +1438,24 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
           pushBlockLines(state, from, to, `cm-md-${node.name.toLowerCase()}`, ranges)
           break
         }
+        case 'SetextHeading1':
+        case 'SetextHeading2': {
+          const underline = node.node.getChild('HeaderMark')
+          if (!underline) break
+          const first = state.doc.lineAt(from).number
+          const marker = state.doc.lineAt(underline.from)
+          const heading = Decoration.line({
+            class: `cm-md-atxheading${node.name.at(-1)}`,
+            attributes: { 'data-setext-heading': String(from) },
+          })
+          for (let line = first; line < marker.number; line++) {
+            const start = state.doc.line(line).from
+            ranges.push({ from: start, to: start, deco: heading })
+          }
+          ranges.push({ from: marker.from, to: marker.to, deco: hide(marker.from, marker.to) })
+          ranges.push({ from: marker.from, to: marker.from, deco: BLOCK('cm-md-heading-underline') })
+          break
+        }
         case 'EmphasisMark':
         case 'StrikethroughMark':
         case 'CodeMark': {
@@ -1504,6 +1474,7 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
           break
         }
         case 'HeaderMark': {
+          if (node.node.parent?.name.startsWith('Setext')) break
           // 标题的 `#` 连同后面那个空格一起藏，否则标题会比正文右移一个字
           hideMarker(state, from, to, ranges, active)
           break
@@ -1522,6 +1493,18 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
         }
         case 'Strikethrough': {
           ranges.push({ from, to, deco: MARK({ class: 'cm-md-strike' }) })
+          break
+        }
+        case 'Escape':
+        case 'Entity': {
+          // 围栏内嵌语言也可能有同名节点，只处理 Markdown 自己的行内节点。
+          if (node.type !== markdownParser.nodeSet.types[node.type.id]) break
+          const raw = state.sliceDoc(from, to)
+          const text = decodeString(raw)
+          if (text !== raw) {
+            const widget = new InlineCharacterWidget(text.replace(/[\t\n\r\f]/g, ' '))
+            ranges.push({ from, to, deco: Decoration.replace({ widget }) })
+          }
           break
         }
         case 'URL': {

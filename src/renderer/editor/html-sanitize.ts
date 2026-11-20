@@ -20,6 +20,10 @@ const SAFE_STYLE_PROPERTY = /^(?:text-align|color|background|background-color|fo
 /** 地址类属性里不许出现的协议。 */
 const DANGEROUS_URL = /^\s*(?:javascript|vbscript|data:text\/html)/i
 
+export function isSafeURL(value: string): boolean {
+  return !DANGEROUS_URL.test(value.replace(/[\t\n\r]/g, ''))
+}
+
 export function cleanStyle(value: string): string {
   return value
     .split(';')
@@ -41,7 +45,7 @@ function cleanElement(element: Element): void {
       else element.removeAttribute('style')
       continue
     }
-    if ((name === 'src' || name === 'href' || name === 'xlink:href') && DANGEROUS_URL.test(attribute.value)) {
+    if ((name === 'src' || name === 'href' || name === 'xlink:href') && !isSafeURL(attribute.value)) {
       element.removeAttribute(attribute.name)
     }
   }

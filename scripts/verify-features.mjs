@@ -1542,7 +1542,7 @@ function main() {
         await sleep(400)
       }
 
-      // 表格：点第二行第二格 → 整块退回源码，而且光标就落在点到的那一格上（#153）。
+      // 表格：点第二行第二格，确认时只把这格写回 Markdown。
       const tableAppeared = await waitFor('.cm-md-table-widget')
       await clickBox(JSON.parse(await evaluate(renderer, `(() => {
         const table = document.querySelector('.cm-md-table-widget')
@@ -1553,27 +1553,28 @@ function main() {
       })()`)))
       const revealed = JSON.parse(await evaluate(renderer, `JSON.stringify({
         widgets: document.querySelectorAll('.cm-md-table-widget').length,
-        rows: document.querySelectorAll('#editor .cm-md-table').length
+        focusedCell: document.activeElement?.classList.contains('cm-md-table-cell-input'),
+        value: document.activeElement?.value
       })`))
-      check('点表格一格就退回源码（#153）',
-        tableAppeared && revealed.widgets === 0 && revealed.rows >= 4,
-        `表格出现=${tableAppeared} 点完渲染块=${revealed.widgets} 源码行=${revealed.rows}`)
+      check('点表格一格在原位编辑',
+        tableAppeared && revealed.widgets === 1 && revealed.focusedCell && revealed.value === '乙三', revealed)
 
       // 打字改的是点到的格，不是表格开头。文件里那一行必须还是表格的一行。
       await renderer.send('Input.insertText', { text: 'Z' })
+      await pressKey(renderer, 'Enter', 'Enter', 13)
       await sleep(1600)
       const typedCell = readFileSync(source, 'utf8').split('\n').find((l) => l.includes('乙三')) ?? ''
       check('点哪一格，打字就改哪一格（#153）',
-        /Z\s*乙三/.test(typedCell) && typedCell.trim().startsWith('|') && typedCell.trim().endsWith('|'),
+        /乙三Z/.test(typedCell) && typedCell.trim().startsWith('|') && typedCell.trim().endsWith('|'),
         `点到的行=${JSON.stringify(typedCell)}`)
       await pressKey(renderer, 'z', 'KeyZ', 90, 4)
       await sleep(1600)
       const undoneCell = readFileSync(source, 'utf8').split('\n').find((l) => l.includes('乙三')) ?? ''
-      check('撤销回到点之前', !/Z\s*乙三/.test(undoneCell), `撤销后=${JSON.stringify(undoneCell)}`)
+      check('撤销回到点之前', !/乙三Z/.test(undoneCell), `撤销后=${JSON.stringify(undoneCell)}`)
 
-      // 点走：表格重新渲染回来（光标不在块里就不该再露源码）
+      // 点走：表格始终保持渲染。
       await clickLine(renderer, '行内公式')
-      check('点走之后表格重新渲染', Number(await evaluate(renderer, `document.querySelectorAll('.cm-md-table-widget').length`)) === 1,
+      check('点走之后仍显示表格', Number(await evaluate(renderer, `document.querySelectorAll('.cm-md-table-widget').length`)) === 1,
         `点走后的渲染块=${await evaluate(renderer, `document.querySelectorAll('.cm-md-table-widget').length`)}`)
 
       // 图片：点一下排版要还在（它的源码就一行，不露）

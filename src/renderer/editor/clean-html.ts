@@ -43,6 +43,7 @@ function escapeAttribute(value: string): string {
 
 function lineKind(line: HTMLElement, includeList = true): LineKind {
   const classes = line.classList
+  if (classes.contains('cm-md-heading-underline')) return 'empty'
   for (let level = 1; level <= 6; level++) {
     if (classes.contains(`cm-md-atxheading${level}`)) return `h${level}` as LineKind
   }
@@ -89,7 +90,7 @@ function inlineHTML(node: Node): string {
   }
   if (classes.contains('cm-md-link')) {
     const href = node.getAttribute('data-href') ?? ''
-    return `<a href="${escapeAttribute(href)}">${childrenHTML(node)}</a>`
+    return href ? `<a href="${escapeAttribute(href)}">${childrenHTML(node)}</a>` : childrenHTML(node)
   }
   if (classes.contains('cm-md-footnote-ref')) {
     return `<sup>${escapeText(node.textContent ?? '')}</sup>`
@@ -238,6 +239,7 @@ function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): str
     // 单元格里的行内公式外面还套着一层 `<span class="cm-md-math">`，整棵克隆会
     // 把它带出去（#198 合进来之后暴露的），所以先拆外壳再剥类名。
     const clone = table.cloneNode(true) as HTMLTableElement
+    clone.querySelector('.cm-md-table-cell-input')?.remove()
     for (const header of Array.from(clone.tHead?.rows[0]?.cells ?? [])) {
       header.style.removeProperty(TABLE_COLUMN_MIN_WIDTH)
     }
@@ -260,7 +262,7 @@ function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): str
   if (kind === 'empty') return ''
   if (kind.startsWith('h')) {
     const level = kind.slice(1)
-    return `<h${level}>${lineHTML(lines[0])}</h${level}>`
+    return `<h${level}>${lines.map(lineHTML).join(' ')}</h${level}>`
   }
   const separator = ownerDepth >= 0 && lines.length > 1 ? '<br>' : '\n'
   return `<p>${lines.map(line => {
@@ -334,12 +336,14 @@ function blocksHTML(nodes: Node[], ownerDepth = -1): string {
     const kind = lineKind(node, !context)
     const group = [node]
     const paragraph = node.dataset.listParagraph
-    if (mergeable(kind) || (kind === 'p' && paragraph)) {
+    const setext = node.dataset.setextHeading
+    if (mergeable(kind) || (kind === 'p' && paragraph) || setext) {
       let next = index + 1
       while (next < nodes.length) {
         const candidate = nodes[next]
         if (!(candidate instanceof HTMLElement) || lineKind(candidate, !listContext(candidate)) !== kind ||
-            (kind === 'p' && candidate.dataset.listParagraph !== paragraph)) break
+            (kind === 'p' && candidate.dataset.listParagraph !== paragraph) ||
+            (setext && candidate.dataset.setextHeading !== setext)) break
         group.push(candidate)
         next += 1
       }

@@ -73,6 +73,7 @@ const CASES = [
   ['dollar then bold after', 'costs $5 and **bold** here\n'],
   ['single dollar run', '$5 and $6 and $7\n'],
   ['dollar escape', '\\$5 是转义\n'],
+  ['Feishu escapes and entities', '## 1\\.1 S\\&OP&#x20;计划\r\n\r\n正文 &amp; &#32; `&#x20;`\r\n'],
   ['math and price on one line', '$x$ 和 $5\n'],
   ['underscore in word', 'snake_case_name\n'],
   ['price with cents', '$1,299.99 起\n'],

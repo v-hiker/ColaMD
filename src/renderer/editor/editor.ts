@@ -21,6 +21,7 @@ import { runFormatCommand as runFormat, type FormatCommandId } from './format-co
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
+import { finishCellEdit, installTableCellEditing } from './table-cell-edit'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -228,6 +229,7 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
 
   // ⌘/Ctrl+Enter 切换光标所在的任务列表项
   root.addEventListener('keydown', (e) => {
+    if (e.target instanceof HTMLTextAreaElement) return
     if (!(e.metaKey || e.ctrlKey) || e.key !== 'Enter') return
     e.preventDefault()
     toggleTaskAt(view, view.state.selection.main.from)
@@ -254,19 +256,7 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
     })
   })
 
-  // 编辑时按点到的单元格落光标（#153），阅读时交给浏览器拖选。
-  // 编辑态在捕获阶段处理 mousedown，避免编辑器先把表格切成源码后丢失单元格位置。
-  root.addEventListener('mousedown', (e) => {
-    if (e.button !== 0 || view.state.readOnly) return
-    const widget = tableWidgetOf(e.target)
-    if (!widget) return
-    const anchor = tableCellAnchor(view, widget, e)
-    if (anchor === null) return
-    e.preventDefault()
-    e.stopPropagation()
-    view.dispatch({ selection: { anchor }, scrollIntoView: true })
-    view.focus()
-  }, true)
+  installTableCellEditing(root, view)
 
   // 点一下被替换掉的块（公式、图片、图、HTML），把光标放进它的源码里就地改。
   //
@@ -275,9 +265,12 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
   // #138 报上来：换内核之后表格、图、图片都点不进去了，而 2.6 是可以改的。
   // 现在每个替换块都带着自己的源码区间（见 live-preview 的 withSourceRange），
   // 一个处理器管全部；块级 widget 的光标落点有 isBlockActive 兜着，光标进去就露源码。
-  // 表格按点到的单元格落光标，由上面的处理器负责。
+  // 表格通过自己的原位编辑器处理点击。普通点击链接时保持编辑焦点。
   root.addEventListener('click', (e) => {
-    if (view.state.readOnly && tableWidgetOf(e.target)) return
+    if (tableWidgetOf(e.target)) {
+      if (!view.state.readOnly && e.target instanceof Element && e.target.closest('a')) e.preventDefault()
+      return
+    }
     // 图上的缩放控件、以及放大态下的图，都是控件自己的地盘：点一下就把光标送进源码，
     // 图当场没了，正在看的局部也就白缩了（控件由 mermaid-bridge 的 attachDiagramZoom 装）。
     const hit = e.target as HTMLElement
@@ -301,65 +294,6 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
 function tableWidgetOf(target: EventTarget | null): HTMLElement | null {
   if (!(target instanceof HTMLElement)) return null
   return target.closest('.cm-md-table-widget')
-}
-
-/**
- * 点在表格的哪一格，就把光标放到源码里那一格的开头（#153）。
- *
- * 表格是整块替换渲染的，光标落进块里才会露源码，所以在点到之前，落在哪儿全靠算。
- * 一律落在块开头的话，点第三行却在表头打字，第一个字就把表格拆散了：渲染好的表格
- * 会整块退回 markdown 源码（#153 报的）。
- *
- * 行从点到的 `<tr>` 数，列从点到的 `<td>` 数，再按源码里未转义的 `|` 对齐；
- * 拆法与 live-preview 的 parseTable 保持一致（`\|` 不算分隔符）。
- */
-function tableCellAnchor(view: EditorView, widget: HTMLElement, e: MouseEvent): number | null {
-  const target = e.target
-  if (!(target instanceof HTMLElement)) return null
-  const row = target.closest('tr')
-  if (!row) return null
-  const rowIndex = [...widget.querySelectorAll('tr')].indexOf(row)
-  if (rowIndex < 0) return null
-  const cell = target.closest('th, td')
-  const cellIndex = cell ? [...row.children].indexOf(cell) : 0
-
-  const doc = view.state.doc
-  const header = doc.lineAt(Number(widget.dataset.sourceFrom))
-  // 源码里表头下面还有一行分隔行，所以正文行比渲染出来的行号多一
-  const sourceLine = rowIndex === 0 ? header.number : header.number + rowIndex + 1
-  if (sourceLine > doc.lines) return null
-  const line = doc.line(sourceLine)
-  return tableCellStart(line.text, line.from, Math.max(0, cellIndex))
-}
-
-/** 表格源码行里第 index 格的起始位置。 */
-function tableCellStart(text: string, from: number, index: number): number {
-  const trimmed = text.trimStart()
-  const leadingSpaces = text.length - trimmed.length
-  const hasLeadingPipe = trimmed.startsWith('|')
-
-  const starts: number[] = []
-  let i = 0
-
-  if (hasLeadingPipe) {
-    const firstPipe = text.indexOf('|')
-    i = firstPipe + 1
-    starts.push(from + i)
-  } else {
-    starts.push(from + leadingSpaces)
-    i = leadingSpaces
-  }
-
-  for (; i < text.length; i++) {
-    if (text[i] === '\\' && text[i + 1] === '|') {
-      i++
-      continue
-    }
-    if (text[i] === '|') {
-      starts.push(from + i + 1)
-    }
-  }
-  return starts[Math.min(index, starts.length - 1)]
 }
 
 /** 写剪贴板。`navigator.clipboard` 在个别环境下会被拒，退回 execCommand。 */
@@ -491,7 +425,7 @@ function setupRichCopy(root: HTMLElement): void {
     event.stopPropagation()
   }, true)
   root.addEventListener('copy', (event) => {
-    if (!(event instanceof ClipboardEvent)) return
+    if (!(event instanceof ClipboardEvent) || event.target instanceof HTMLTextAreaElement) return
     const view = getEditorView()
     if (!view) return
     // 没选中东西时不动：CodeMirror 那时复制的是整行，那是它更懂的行为。
@@ -675,7 +609,14 @@ export function focusEditor(): void {
 // 放映幻灯片时把编辑器冻住。按键在到达编辑器之前就已经被拦住了
 // （renderer/slideshow.ts）；这是第二道锁，万一有键漏过来，也落不到没人看得见的页面上。
 export function setEditorEditable(editable: boolean): void {
+  if (!editable) finishTableCellEdit()
   handle?.setEditable(editable)
+}
+
+/** Confirm pending cell text before a command reads or locks the document. */
+export function finishTableCellEdit(): number | null {
+  const view = getEditorView()
+  return view ? finishCellEdit(view)?.position ?? null : null
 }
 
 // 图片灯箱：右键菜单的「查看原图」走主进程绕一圈回来，需要在这里露一个入口。
@@ -693,6 +634,7 @@ export { openImageOverlay }
 export function setReadingMode(active: boolean): void {
   const view = handle?.getView()
   if (!view) return
+  if (active) finishCellEdit(view)
   view.dispatch({ effects: setReadingModeEffect.of(active) })
   handle?.setEditable(!active)
 }
@@ -745,6 +687,7 @@ export function setDocumentFileUrl(url: string | null): void {
 export function setCleanExport(on: boolean): void {
   const view = handle?.getView()
   if (!view) return
+  if (on) finishCellEdit(view)
   view.dispatch({ effects: setCleanExportEffect.of(on) })
 }
 
