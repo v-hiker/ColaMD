@@ -16,7 +16,8 @@ import { footnoteDefinitions } from './footnotes'
 import { selectionHTMLFrom } from './clean-html'
 import { renderWholeDocument, restoreViewport } from '../print-layout'
 
-import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, setReadingMode as setReadingModeEffect, openImageOverlay, primeDocumentFileUrl } from './live-preview'
+import { headingFlashEffect, readingModeField, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, setReadingMode as setReadingModeEffect, primeDocumentFileUrl } from './live-preview'
+import { openImageOverlay } from './image-overlay'
 import { runFormatCommand as runFormat, type FormatCommandId } from './format-commands'
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
@@ -191,12 +192,19 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
     }
   }, true)
 
-  // 文档内锚点是纯导航：在捕获阶段处理掉，别让 CM6 再插手，
-  // 否则放置光标（以及它异步的滚动到选区）会盖掉这次标题跳转（#50）。
+  // 在捕获阶段处理只读表格看图和锚点导航，避免 CodeMirror 把点击变成光标落点。
   root.addEventListener(
     'click',
     (e) => {
       if (e.button !== 0) return
+      const image = e.target
+      if (!e.metaKey && !e.ctrlKey && view.state.field(readingModeField, false) &&
+          image instanceof HTMLImageElement && image.naturalWidth && tableWidgetOf(image)) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        openImageOverlay(image.currentSrc || image.src, image.alt)
+        return
+      }
       const href = linkHrefOf(e.target)
       if (!href || !href.startsWith('#')) return
       e.preventDefault()

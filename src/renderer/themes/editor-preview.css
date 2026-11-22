@@ -301,7 +301,7 @@
  * 夹着一个块级 widget，就成了两个各 30.4px 高的匿名块，照样多出 61px。所以要让它们
  * **脱离行内流**（absolute）。不能用 display:none：缓冲块是 CodeMirror 用来给光标定位
  * 的，没有 rect 时光标会跳到别处。 */
-.cm-content .cm-line:has(> .cm-md-table-widget) > .cm-widgetBuffer,
+.cm-content .cm-line:has(> .cm-md-table-scroll) > .cm-widgetBuffer,
 .cm-content .cm-line:has(> .cm-md-mermaid) > .cm-widgetBuffer,
 .cm-content .cm-line:has(> .cm-md-math-block) > .cm-widgetBuffer,
 .cm-content .cm-line:has(> .cm-md-html-block) > .cm-widgetBuffer {
@@ -325,14 +325,27 @@
  * getBoundingClientRect() 量的，外边距不算在 rect 里，可浏览器排版时又真的占位置，
  * 于是它往后每一行的坐标都比 CodeMirror 记的偏低一截，点正文时光标落到下一行
  * （#199，两张表叠起来就够错一行）。 */
+.cm-content .cm-md-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.25em 0;
+}
+
+body:is(.exporting, .paper, .slides-printing) .cm-content .cm-md-table-scroll {
+  overflow: visible;
+}
+
 .cm-content .cm-md-table-widget {
   border-collapse: collapse;
   width: 100%;
-  padding: 0.25em 0;
 }
 
 body.reading-mode .cm-content .cm-md-table-widget {
   user-select: text;
+}
+
+body.reading-mode .cm-content .cm-md-table-widget img {
+  cursor: zoom-in;
 }
 
 /* 表格内使用原生选区，覆盖 CodeMirror 为正文选区层关闭的原生高亮。 */
@@ -839,6 +852,17 @@ body.theme-notion .cm-content .cm-md-url {
   transition: transform 0.12s ease-out;
   transform-origin: center center;
   cursor: zoom-in;
+  touch-action: none;
+  user-select: none;
+}
+
+.cm-image-overlay.can-pan img {
+  cursor: grab;
+}
+
+.cm-image-overlay.panning img {
+  cursor: grabbing;
+  transition: none;
 }
 
 .cm-image-overlay.open {

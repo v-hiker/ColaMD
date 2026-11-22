@@ -21,6 +21,12 @@ interface CellEdit {
 const activeEdits = new WeakMap<EditorView, CellEdit>()
 const tableOwners = new WeakMap<HTMLElement, EditorView>()
 
+function tableAt(view: EditorView, from: number): HTMLTableElement | null {
+  return view.contentDOM.querySelector<HTMLTableElement>(
+    'table.cm-md-table-widget[data-source-from="' + from + '"]',
+  )
+}
+
 export function finishCellEdit(view: EditorView, confirm = true): { position: number; changes: ChangeDesc | null } | null {
   const edit = activeEdits.get(view)
   if (!edit) return null
@@ -35,8 +41,14 @@ export function finishCellEdit(view: EditorView, confirm = true): { position: nu
   const position = edit.target.cell?.from ?? edit.target.row.to
   const change = tableCellChange(edit.target, value, (pos) => view.state.sliceDoc(pos, pos + 1))
   if (!change) return { position, changes: null }
+  const scrollLeft = edit.table.parentElement?.scrollLeft ?? 0
   const transaction = view.state.update({ changes: change, annotations: isolateHistory.of('full') })
   view.dispatch(transaction)
+  if (scrollLeft) {
+    const from = transaction.changes.mapPos(Number(edit.table.dataset.sourceFrom), -1)
+    const viewport = tableAt(view, from)?.parentElement
+    if (viewport) viewport.scrollLeft = scrollLeft
+  }
   return { position: change.from, changes: transaction.changes }
 }
 
@@ -59,9 +71,7 @@ function addressOf(table: HTMLTableElement, cell: HTMLTableCellElement): CellAdd
 
 function openAt(view: EditorView, address: CellAddress, changes: ChangeDesc | null | undefined): boolean {
   const from = changes?.mapPos(address.tableFrom, -1) ?? address.tableFrom
-  const table = view.contentDOM.querySelector<HTMLTableElement>(
-    'table.cm-md-table-widget[data-source-from="' + from + '"]',
-  )
+  const table = tableAt(view, from)
   const cell = table?.rows[address.row]?.cells[address.column]
   if (!table || !cell) return false
   return openCell(view, table, cell)
@@ -92,6 +102,17 @@ function openCell(view: EditorView, table: HTMLTableElement, cell: HTMLTableCell
   cell.append(input)
   input.focus({ preventScroll: true })
   input.setSelectionRange(input.value.length, input.value.length)
+  const viewport = table.parentElement
+  if (viewport && viewport.scrollWidth > viewport.clientWidth) {
+    const { left } = viewport.getBoundingClientRect()
+    const bounds = cell.getBoundingClientRect()
+    const right = left + viewport.clientWidth
+    if (bounds.left < left || bounds.width > viewport.clientWidth) {
+      viewport.scrollLeft += bounds.left - left
+    } else if (bounds.right > right) {
+      viewport.scrollLeft += bounds.right - right
+    }
+  }
 
   input.addEventListener('blur', () => {
     queueMicrotask(() => {

@@ -25,11 +25,15 @@
   font-size: 1em;
 }
 
+#editor .cm-content .cm-md-table-scroll {
+  container-type: inline-size;
+  padding: 0.2em 0 0.7em;
+}
+
 #editor .cm-content .cm-md-table-widget {
   width: 100%;
   border-collapse: collapse;
   table-layout: auto;
-  margin: 0.2em 0 0.7em;
 }
 
 #editor .cm-content .cm-md-table-widget th,
@@ -45,6 +49,39 @@
   font-weight: 600;
   min-width: var(--cm-md-column-min-width, 0);
   border-bottom-color: color-mix(in srgb, var(--text-color) 22%, var(--border-color));
+}
+
+/* 多列表格在窄正文栏优先保住表头和参数名，靠表格自己的容器横向滚动。 */
+@container (max-width: 640px) {
+  body:not(.exporting, .paper, .slides-printing, .presenting) #editor .cm-content .cm-md-table-widget:has(thead th:nth-child(4)) th {
+    min-width: max(6em, var(--cm-md-column-min-width, 0px));
+  }
+
+  body:not(.exporting, .paper, .slides-printing, .presenting) #editor .cm-content .cm-md-table-widget:has(thead th:nth-child(4)) td > code:only-child {
+    white-space: nowrap;
+  }
+}
+
+/* 表格内的大图按比例缩小，避免原图尺寸撑开列宽和行高。 */
+#editor .cm-content .cm-md-table-widget :is(th, td) img {
+  max-width: min(100%, 280px);
+  max-height: 180px;
+  width: auto;
+  height: auto;
+  vertical-align: middle;
+}
+
+#editor .cm-content .cm-md-table-image {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: min(100%, 280px);
+  margin: 0;
+  vertical-align: middle;
+}
+
+#editor .cm-content .cm-md-table-image .cm-md-image-caption {
+  overflow-wrap: anywhere;
 }
 
 #editor .cm-content .cm-md-table-widget.cm-md-table-measuring :is(th, td) {
@@ -83,16 +120,26 @@
   letter-spacing: 0.01em;
 }
 
-/* ---- 独占一行的图片居中 ---- */
+/* ---- 正文插图与正文左边线对齐 ---- */
 
-/* 原样式是 inline-block，宽度不足列宽的图贴在左边、右边空一片。
- * 只补居中，不动 max-width（只缩不放要留着）。 */
 #editor .cm-content .cm-line:has(> .cm-md-image) {
-  text-align: center;
+  text-align: start;
 }
 
 #editor .cm-content .cm-md-image {
+  max-width: min(100%, 1024px);
   margin: 0.35em 0;
+}
+
+/* 常见横图按共同宽度排版，长图仍有高度上限。 */
+#editor .cm-content .cm-md-image img {
+  max-height: max(65vh, 800px);
+}
+
+#editor .cm-content .cm-md-image > .cm-md-image-caption {
+  align-self: stretch;
+  contain: inline-size;
+  overflow-wrap: anywhere;
 }
 
 /* ---- Wide 档跟随窗口 ---- */

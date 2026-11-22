@@ -1527,11 +1527,6 @@ body.presenting #editor .cm-content > * {
   max-width: 100%;
 }
 
-body.presenting #editor .cm-content .cm-md-table-widget {
-  display: block;
-  overflow-x: auto;
-}
-
 body.presenting #editor .cm-content .cm-md-codeblock {
   overflow-x: auto;
 }

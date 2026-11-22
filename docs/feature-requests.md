@@ -52,6 +52,12 @@ The reading toggle applies to both rendered and source views, so readers can ins
 
 Rendered text tables can give a column slightly more width when doing so reduces wrapping across the whole table. The layout uses measured text widths and updates as the available width changes.
 
+When a wide table exceeds the reading column, the table scrolls horizontally within its own area. In narrow columns, multi-column tables preserve a readable minimum for headers and keep inline-code identifiers on one line.
+
+### Table image preview in reading mode
+
+Click an image in a rendered table in reading mode to open the original in the same viewer as a document image. Use the wheel to zoom and drag across a zoomed image to inspect its edges.
+
 ### Edit a rendered table cell in place
 
 Click a cell to edit its text inside the table. Enter or clicking elsewhere confirms, Tab confirms and advances, and Escape cancels. A confirmed edit is a single undo step. Use source mode to change rows, columns, or alignment.

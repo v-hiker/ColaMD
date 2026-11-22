@@ -601,6 +601,62 @@ try {
   check('切标签前确认编辑，并且只保存到原文件', readFileSync(readingFile, 'utf8') === cellBeforeLeaving &&
     readFileSync(fileB, 'utf8') === textB && statSync(fileB).mtimeMs === mtimeB)
 
+  const previewImage = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000"><rect width="1600" height="1000" fill="#345"/></svg>').toString('base64')
+  const wideTableText = [
+    '# 窄窗口中的表格', '',
+    '| 参数键名 | 工程用途 | 推荐值一 | 推荐值二 | 推荐值三 |',
+    '| --- | --- | --- | --- | --- |',
+    '| `parenthesized_elevation_as_beam_top` | 梁顶标高判定 | false | false | true |',
+    '| ![表内图注](data:image/svg+xml;base64,' + previewImage + ') | 查看工程图 | A | B | C |', '',
+  ].join('\n')
+  const wideTableFile = join(runtime, 'scroll-and-image.md')
+  writeFileSync(wideTableFile, wideTableText)
+  await openFixture(wideTableFile, wideTableText)
+  await readingToggle()
+  await send('Emulation.setDeviceMetricsOverride', { width: 480, height: 780, deviceScaleFactor: 1, mobile: false })
+  await waitFor("document.querySelector('.cm-md-table-scroll img')?.naturalWidth === 1600", '表格图片未加载')
+  const galleryPoint = await evaluate(`(() => {
+    const rect = document.querySelector('.cm-md-table-scroll img').getBoundingClientRect()
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  })()`)
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await send('Input.dispatchMouseEvent', { type, ...galleryPoint, button: 'left', clickCount: 1 })
+  }
+  await waitFor("document.querySelector('.cm-image-overlay.open img')?.naturalWidth === 1600", '单击表格图片未打开原图')
+  check('阅读模式单击格内图打开带图注的原图', await evaluate(`
+    document.querySelector('.cm-image-overlay.open img').alt === '表内图注' &&
+    !document.querySelector('.cm-md-table-cell-input')`))
+  await evaluate(`(() => {
+    const image = document.querySelector('.cm-image-overlay.open img')
+    image.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+  })()`)
+  await waitFor("document.querySelector('.cm-image-overlay.can-pan.open')", '原图放大后不可平移')
+  await pause(160)
+  const panStart = await evaluate("document.querySelector('.cm-image-overlay img').getBoundingClientRect().left")
+  await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: 240, y: 390, button: 'left', buttons: 1, clickCount: 1 })
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 330, y: 390, button: 'left', buttons: 1 })
+  await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 330, y: 390, button: 'left', clickCount: 1 })
+  check('放大后的原图支持鼠标拖动',
+    await evaluate("document.querySelector('.cm-image-overlay.open img').getBoundingClientRect().left") - panStart > 60)
+  await pressEditorKey('Escape', 27)
+  await waitFor("!document.querySelector('.cm-image-overlay.open')", '未关闭原图查看器')
+  const tablePoint = await evaluate(`(() => {
+    const rect = document.querySelector('.cm-md-table-scroll').getBoundingClientRect()
+    return { x: rect.left + rect.width / 2, y: rect.top + 24 }
+  })()`)
+  await send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...tablePoint, deltaX: 1000, deltaY: 0 })
+  await waitFor("document.querySelector('.cm-md-table-scroll').scrollLeft > 0", '宽表格没有横向滚动')
+  check('窄窗口横向滚动只移动表格，长参数名可读', await evaluate(`(() => {
+    const wrap = document.querySelector('.cm-md-table-scroll')
+    const code = wrap.querySelector('code')
+    const text = document.createRange()
+    text.selectNodeContents(code)
+    return wrap.scrollLeft > 0 && v.scrollDOM.scrollLeft === 0 &&
+      v.scrollDOM.scrollWidth <= v.scrollDOM.clientWidth + 1 && text.getClientRects().length === 1
+  })()`))
+  await readingToggle()
+  await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 780, deviceScaleFactor: 1, mobile: false })
+
   const tableRowsForLayout = [
     ['任务清单输出', '表格只列出每项任务自己的编号、名称和进度，缺少关联信息，还要手工翻查其他记录。', '自动列出当前分组内每项任务的关联记录，并按实际进度输出一份完整清单。'],
     ['分类排序与去重', '手工整理时容易把同一分组内的相邻任务、不同分组内的重复任务记错。', '先按当前的分类规则确定任务分组，再按统一的标准排序并去重。'],

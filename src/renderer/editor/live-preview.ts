@@ -35,6 +35,7 @@ import { footnoteDefinitions, footnoteNumbers, FOOTNOTE_REF_RE } from './footnot
 import { observeTableLayout, stopObservingTableLayout } from './table-layout'
 import { attachTableRows, displayCellText, readTableSource, type CellSource } from './table-source'
 import { finishRemovedTableEdit } from './table-cell-edit'
+import { openImageOverlay } from './image-overlay'
 import { isChinese } from '../ui-language'
 
 /** 给区间加样式类，不隐藏任何字符。 */
@@ -331,84 +332,6 @@ function withSourceRange<T extends HTMLElement>(el: T, from: number, to: number)
   return el
 }
 
-/**
- * 图片灯箱。
- *
- * 编辑器里的图片被控制在阅读列宽之内（只缩不放，见 editor-preview.css），
- * 于是 CAD 截图、架构图缩到一千多像素之后，图里的标注就糊成一片。点一下看原图，
- * 是「只缩不放」缺的那另一半。
- *
- * 这一层挂在 body 上而不是编辑器 DOM 里：它要盖住整个窗口，也不该跟着文档滚动。
- * 第一次点击时才创建，之后复用同一个节点——每张图各建一个的话，一篇几十张图的文档
- * 光是不可见的 DOM 就够呛。
- */
-let imageOverlay: HTMLDivElement | null = null
-/** 灯箱里的缩放比例，滚轮改它，双击在 1x/2x 之间切。 */
-let overlayScale = 1
-
-/** 右键菜单里的「查看原图」从这里进来（主进程那侧只能发一个 src 回来）。 */
-export function openImageOverlay(src: string, alt = ''): void {
-  showImageOverlay(src, alt)
-}
-
-function applyOverlayScale(img: HTMLImageElement): void {
-  img.style.transform = overlayScale === 1 ? '' : `scale(${overlayScale})`
-}
-
-function showImageOverlay(src: string, alt: string): void {
-  if (!imageOverlay) {
-    const box = document.createElement('div')
-    box.className = 'cm-image-overlay'
-    box.setAttribute('role', 'dialog')
-    box.setAttribute('aria-modal', 'true')
-    const img = document.createElement('img')
-    const caption = document.createElement('div')
-    caption.className = 'cm-image-overlay-caption'
-    box.append(img, caption)
-    // 整个遮罩都是关闭热区：这层里除了图没有别的东西可点。
-    box.addEventListener('click', () => box.classList.remove('open'))
-    imageOverlay = box
-    document.body.appendChild(box)
-    // Esc 关闭。用捕获阶段，免得被编辑器自己的 keymap 先吃掉。
-    document.addEventListener('keydown', (event) => {
-      if (event.key !== 'Escape' || !imageOverlay?.classList.contains('open')) return
-      imageOverlay.classList.remove('open')
-      event.preventDefault()
-      event.stopPropagation()
-    }, true)
-  }
-
-  const img = imageOverlay.querySelector('img') as HTMLImageElement
-  const caption = imageOverlay.querySelector('.cm-image-overlay-caption') as HTMLElement
-
-  if (!img.dataset.bound) {
-    img.dataset.bound = '1'
-    // 滚轮缩放。被动监听拦不住页面滚动，这里必须 preventDefault。
-    img.addEventListener('wheel', (event) => {
-      event.preventDefault()
-      event.stopPropagation()
-      const next = event.deltaY > 0 ? overlayScale / 1.15 : overlayScale * 1.15
-      overlayScale = Math.min(8, Math.max(0.15, next))
-      applyOverlayScale(img)
-    }, { passive: false })
-    // 双击在 1x / 2x 之间切；点图片本身不该关掉遮罩，所以停掉冒泡。
-    img.addEventListener('dblclick', (event) => {
-      event.stopPropagation()
-      overlayScale = overlayScale === 1 ? 2 : 1
-      applyOverlayScale(img)
-    })
-    img.addEventListener('click', (event) => event.stopPropagation())
-  }
-
-  overlayScale = 1
-  applyOverlayScale(img)
-  img.src = src
-  img.alt = alt
-  caption.textContent = alt.trim() === '' ? '滚轮缩放 · 双击看细节 · 点空白处关闭' : alt
-  caption.hidden = false
-  imageOverlay.classList.add('open')
-}
-
 class ImageWidget extends WidgetType {
   constructor(
     readonly src: string,
@@ -437,7 +360,7 @@ class ImageWidget extends WidgetType {
     img.addEventListener('click', (event) => {
       event.preventDefault()
       event.stopPropagation()
-      showImageOverlay(this.src, this.alt)
+      openImageOverlay(this.src, this.alt)
     })
     img.addEventListener('load', () => {
       remeasureAfterDraw()
@@ -879,12 +802,15 @@ class TableWidget extends WidgetType {
 
   toDOM(): HTMLElement {
     const [head, alignment, ...body] = readTableSource(this.node, this.source)
+    const viewport = document.createElement('div')
+    viewport.className = 'cm-md-table-scroll'
     const table = document.createElement('table')
     table.className = 'cm-md-table-widget'
     withSourceRange(table, this.node.from, this.node.to)
+    viewport.append(table)
     if (!head || !alignment) {
       table.textContent = this.source
-      return table
+      return viewport
     }
     attachTableRows(table, [head, ...body])
     const thead = document.createElement('thead')
@@ -910,12 +836,14 @@ class TableWidget extends WidgetType {
     }
     table.appendChild(tbody)
     observeTableLayout(table, remeasureAfterDraw)
-    return table
+    return viewport
   }
 
   destroy(dom: HTMLElement): void {
-    stopObservingTableLayout(dom)
-    finishRemovedTableEdit(dom)
+    const table = dom.querySelector('table')
+    if (!table) return
+    stopObservingTableLayout(table)
+    finishRemovedTableEdit(table)
   }
 }
 
@@ -974,8 +902,18 @@ function appendTableCell(parent: HTMLElement, cell: CellSource | undefined, base
       if (node.name === 'Image') {
         const image = document.createElement('img')
         image.alt = decodeString(slice(open.to, close.from))
-        if (isSafeURL(href)) image.src = resolveImageSrc(href, base)
-        return image
+        if (!isSafeURL(href)) return image
+        image.src = resolveImageSrc(href, base)
+        // 独占一格的图片沿用正文的图注方式，混排内容可自行在图后写说明。
+        if (node.from !== start || node.to !== end || !image.alt.trim()) return image
+        const figure = document.createElement('figure')
+        figure.className = 'cm-md-table-image'
+        const caption = document.createElement('figcaption')
+        caption.className = 'cm-md-image-caption'
+        caption.textContent = image.alt
+        image.addEventListener('error', () => caption.remove(), { once: true })
+        figure.append(image, caption)
+        return figure
       }
       const link = document.createElement('a')
       if (node.name === 'Autolink' || open.to === close.from) link.textContent = address

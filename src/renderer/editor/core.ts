@@ -212,7 +212,7 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
   view.contentDOM.addEventListener('mousedown', (event) => {
     if (!(view.state.field(readingModeField, false) ?? false)) return
     const target = event.target as HTMLElement | null
-    if (target?.closest('.cm-md-table-widget, .cm-md-image, .cm-md-mermaid, .cm-md-math-block')) {
+    if (target?.closest('.cm-md-table-scroll, .cm-md-image, .cm-md-mermaid, .cm-md-math-block')) {
       event.stopPropagation()
     }
   }, true)
