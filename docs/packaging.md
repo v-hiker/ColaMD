@@ -54,7 +54,8 @@ CI 上的 mac job（universal 加签名、公证、dmg 压缩）实测 7 分 20 
 - 日常提交推送到 custom 分支。
 - 试装时在 Actions 手动运行 custom-build，从 ColaMD-win64 工件下载 Windows x64 安装包。
 - 发版时提高 package.json 和 package-lock.json 的版本，提交后推送与版本号一致的纯数字标签，例如 2.7.13。GitHub 构建并校验 Windows 产物，再将安装包、绿色版和更新清单一起发布到该标签的 Release。
-- custom-sync 每天北京时间 01:37 检查官方最新正式版，将版本标签对应的提交合并进 custom。遇到冲突时在 custom 分支手动合并。
+- custom-sync 每天北京时间 01:37 检查官方最新正式版。合并进 custom 后，对尚未发布且高于已有正式版的版本调用 custom-build。构建和产物检查通过后，发布同版本号的 Windows 安装包、绿色版和更新清单。
+- 遇到冲突时在 custom 分支手动合并。构建或上传失败后，可重跑 custom-sync。已发布的版本会跳过，自动创建的发布草稿可继续上传。
 
 ## 参考
 

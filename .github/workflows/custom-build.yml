@@ -6,32 +6,43 @@ on:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      revision:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: custom-build-${{ github.ref }}
+  group: custom-build-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: 构建 Windows 安装包
-    if: github.event_name == 'workflow_dispatch' || github.event.created == true
+    if: inputs.version != '' || github.event_name == 'workflow_dispatch' || github.event.created == true
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.revision || github.sha }}
           persist-credentials: false
 
-      - name: 核对版本标签
-        if: github.event_name == 'push'
+      - name: 核对构建版本
+        if: inputs.version != '' || github.event_name == 'push'
         shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_NAME -cne $version) {
-            throw "版本标签 $env:GITHUB_REF_NAME 必须与 package.json 的 $version 一致"
+          if ($env:EXPECTED_VERSION -cne $version) {
+            throw "构建版本 $env:EXPECTED_VERSION 必须与 package.json 的 $version 一致"
           }
 
       - uses: actions/setup-node@v4
@@ -84,11 +95,12 @@ jobs:
             release/*.zip
             release/latest.yml
           retention-days: 30
+          overwrite: true
           if-no-files-found: error
 
   release:
     name: 发布 Windows Release
-    if: github.event_name == 'push' && github.event.created == true
+    if: inputs.version != '' || (github.event_name == 'push' && github.event.created == true)
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -100,6 +112,53 @@ jobs:
           path: artifacts
 
       - name: 发布已构建的安装包
+        if: inputs.version == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+
+      - name: 发布同步后的正式版
+        if: inputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | {tag_name, draft, body}')
+          release=$(printf '%s\n' "$releases" | jq -cs --arg version "$VERSION" \
+            'map(select(.tag_name == $version)) | if length > 1 then error("duplicate releases") else .[0] end')
+          if [[ $(jq -r '.draft' <<< "$release") == false ]]; then
+            echo "Windows $VERSION 已发布。"
+            exit 0
+          fi
+
+          notes="同步 [ColaMD v$VERSION](https://github.com/marswaveai/ColaMD/releases/tag/v$VERSION) 后构建的 Windows x64 版本。构建提交：$REVISION。"
+          if [[ "$release" != null && $(jq -r '.body' <<< "$release") != "$notes" ]]; then
+            echo "::error::版本 $VERSION 已有独立的发布草稿。"
+            exit 1
+          fi
+
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$VERSION" \
+            --jq ".[] | select(.ref == \"refs/tags/$VERSION\") | .object")
+          if [[ -z "$ref" ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$VERSION" -f sha="$REVISION" --silent
+          else
+            while [[ $(jq -r '.type' <<< "$ref") == tag ]]; do
+              object=$(jq -r '.sha' <<< "$ref")
+              ref=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object" --jq .object)
+            done
+            if [[ $(jq -r '.type' <<< "$ref") != commit || $(jq -r '.sha' <<< "$ref") != "$REVISION" ]]; then
+              echo "::error::标签 $VERSION 指向另一提交。"
+              exit 1
+            fi
+          fi
+
+          if [[ "$release" == null ]]; then
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "ColaMD $VERSION" --notes "$notes"
+          fi
+          gh release upload "$VERSION" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -17,6 +17,9 @@ jobs:
   sync:
     name: 合并官方正式版本
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.sync.outputs.version }}
+      revision: ${{ steps.sync.outputs.revision }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,6 +27,7 @@ jobs:
           fetch-depth: 0
 
       - name: 检查并合并最新正式版
+        id: sync
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -38,14 +42,49 @@ jobs:
           upstream=$(git rev-parse 'FETCH_HEAD^{commit}')
           if git merge-base --is-ancestor "$upstream" HEAD; then
             echo "custom 已包含上游正式版 $tag"
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            if ! git merge --no-ff -m "Merge upstream $tag" "$upstream"; then
+              echo "::error::合并上游 $tag 遇到冲突，需要在 custom 分支手动处理。"
+              git merge --abort
+              exit 1
+            fi
+            git push origin HEAD:refs/heads/custom
+          fi
+
+          version=${tag#v}
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | [.tag_name, .prerelease] | @tsv')
+          latest=''
+          while IFS=$'\t' read -r published prerelease; do
+            published=${published#v}
+            [[ "$published" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            if [[ "$published" == "$version" ]]; then
+              echo "Windows $version 已发布。"
+              exit 0
+            fi
+            if [[ "$prerelease" == false ]]; then
+              latest=$(printf '%s\n' "$latest" "$published" | sort -V | tail -n 1)
+            fi
+          done <<< "$releases"
+          if [[ -n "$latest" && $(printf '%s\n' "$latest" "$version" | sort -V | tail -n 1) != "$version" ]]; then
+            echo "上游 $tag 低于已发布版本 $latest。"
             exit 0
           fi
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if ! git merge --no-ff -m "Merge upstream $tag" "$upstream"; then
-            echo "::error::合并上游 $tag 遇到冲突，需要在 custom 分支手动处理。"
-            git merge --abort
-            exit 1
+          # 重试时沿第一父提交线找到引入上游版本的合并提交。
+          revision=$(git rev-list --first-parent --ancestry-path "$upstream..HEAD" | tail -n 1)
+          if [[ -z "$revision" ]] || git merge-base --is-ancestor "$upstream" "$revision^"; then
+            revision=$(git rev-parse HEAD)
           fi
-          git push origin HEAD:refs/heads/custom
+          printf 'version=%s\nrevision=%s\n' "$version" "$revision" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: 构建并发布同步后的 Windows 正式版
+    needs: sync
+    if: needs.sync.outputs.version != ''
+    uses: ./.github/workflows/custom-build.yml
+    with:
+      revision: ${{ needs.sync.outputs.revision }}
+      version: ${{ needs.sync.outputs.version }}
