@@ -566,11 +566,24 @@ body.panel-motion-ready #editor-region {
   color: var(--text-color);
   font: inherit;
   text-align: inherit;
-  resize: none;
 }
 
 .cm-md-table-widget th .cm-md-table-cell-input {
   background: var(--table-header-bg);
+}
+
+#editor .cm-md-table-cell-input .cm-scroller {
+  font: inherit;
+  padding: 0;
+}
+
+#editor .cm-md-table-cell-input .cm-scroller > .cm-content {
+  flex: 1;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  text-align: inherit;
 }
 
 #source-editor {

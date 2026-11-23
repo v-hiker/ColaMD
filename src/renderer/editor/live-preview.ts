@@ -22,7 +22,7 @@
 // 跨行替换与块级 widget 才被允许。
 
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from '@codemirror/view'
-import { EditorState, RangeSetBuilder, StateEffect, StateField, type Extension } from '@codemirror/state'
+import { EditorState, RangeSetBuilder, StateEffect, StateField, type Extension, type Range as StateRange } from '@codemirror/state'
 import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
@@ -950,6 +950,93 @@ function appendTableCell(parent: HTMLElement, cell: CellSource | undefined, base
   }
 
   appendChildren(parent, syntax, start, end)
+}
+
+// Draft lines are table cell content. Even a line starting with # or > is inline text.
+const tableCellParser = markdownParser.configure({ parseBlock: [{
+  name: 'TableCellDraft',
+  before: 'LinkReference',
+  parse(context, line) {
+    const from = context.lineStart
+    const to = from + line.text.length
+    context.addElement(context.elt('Paragraph', from, to, context.parser.parseInline(line.text, from)))
+    context.nextLine()
+    return true
+  },
+}] })
+
+const cellFormatTags: Readonly<Partial<Record<string, string>>> = {
+  StrongEmphasis: 'strong', Emphasis: 'em', Strikethrough: 's', InlineCode: 'code',
+}
+
+class TableCellInlineWidget extends WidgetType {
+  constructor(readonly source: CellSource, readonly base: string | null) { super() }
+
+  eq(other: TableCellInlineWidget): boolean {
+    return other.source.text === this.source.text && other.base === this.base
+  }
+
+  toDOM(): HTMLElement {
+    const span = document.createElement('span')
+    appendTableCell(span, this.source, this.base)
+    return span
+  }
+}
+
+export function tableCellDraftPreview(parent: EditorState): Extension {
+  const base = parent.field(documentFileUrlField, false) ?? documentFileUrl
+  const decorate = (state: EditorState): DecorationSet => {
+    const text = state.doc.toString()
+    const tree = tableCellParser.parse(text)
+    const formulas = scanMath(text, excludedRanges(text, tree))
+      .filter(({ from, to }) => state.doc.lineAt(from).number === state.doc.lineAt(to).number)
+    const ranges: StateRange<Decoration>[] = []
+    const active = (from: number, to: number) => state.selection.ranges.some(range => range.from < to && range.to > from)
+    const replace = (from: number, to: number, widget?: WidgetType) =>
+      ranges.push(Decoration.replace({ widget }).range(from, to))
+
+    for (const { from, to, code } of formulas) {
+      if (!active(from, to)) replace(from, to, new MathWidget(displayCellText(code), false, from, to))
+    }
+
+    tree.iterate({ enter(ref) {
+      const { name, from, to, node } = ref
+      if (name === 'Document' || name === 'Paragraph') return
+      if (formulas.some(formula => formula.from < to && from < formula.to && (from >= formula.from || to <= formula.to))) return false
+      const tag = cellFormatTags[name]
+      if (tag) {
+        if (!active(from, to)) {
+          const first = node.firstChild
+          const last = node.lastChild
+          if (first && last && first.to < last.from) {
+            replace(from, first.to)
+            replace(last.from, to)
+            ranges.push(MARK({ tagName: tag }).range(first.to, last.from))
+          }
+        }
+        if (name === 'InlineCode') return false
+      } else if (name === 'Link') {
+        const [open, close] = node.getChildren('LinkMark')
+        if (node.getChild('URL') && open && close && open.to < close.from && !active(from, to)) {
+          replace(from, open.to)
+          replace(close.from, to)
+          ranges.push(MARK({ class: 'cm-md-link' }).range(open.to, close.from))
+        }
+      } else if (name === 'Image' || name === 'Autolink' || name === 'Escape' || name === 'Entity' ||
+          (name === 'HTMLTag' && /^<br\s*\/?>$/i.test(text.slice(from, to)))) {
+        if (!active(from, to)) {
+          replace(from, to, new TableCellInlineWidget({ from, to, syntax: node.parent ?? undefined, text: text.slice(from, to) }, base))
+        }
+        return false
+      }
+    } })
+    return Decoration.set(ranges, true)
+  }
+  return StateField.define({
+    create: decorate,
+    update: (decorations, tr) => tr.docChanged || tr.selection ? decorate(tr.state) : decorations,
+    provide: field => EditorView.decorations.from(field),
+  })
 }
 
 function collectTables(

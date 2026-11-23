@@ -22,7 +22,7 @@ import { runFormatCommand as runFormat, type FormatCommandId } from './format-co
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
-import { finishCellEdit, installTableCellEditing } from './table-cell-edit'
+import { editedCellSelection, finishCellEdit, installTableCellEditing } from './table-cell-edit'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -434,6 +434,7 @@ function setupRichCopy(root: HTMLElement): void {
   }, true)
   root.addEventListener('copy', (event) => {
     if (!(event instanceof ClipboardEvent) || event.target instanceof HTMLTextAreaElement) return
+    if (event.target instanceof Element && event.target.closest('.cm-md-table-cell-input')) return
     const view = getEditorView()
     if (!view) return
     // 没选中东西时不动：CodeMirror 那时复制的是整行，那是它更懂的行为。
@@ -625,6 +626,11 @@ export function setEditorEditable(editable: boolean): void {
 export function finishTableCellEdit(): number | null {
   const view = getEditorView()
   return view ? finishCellEdit(view)?.position ?? null : null
+}
+
+export function tableCellEditSelection(): string | null {
+  const view = getEditorView()
+  return view ? editedCellSelection(view) : null
 }
 
 // 图片灯箱：右键菜单的「查看原图」走主进程绕一圈回来，需要在这里露一个入口。

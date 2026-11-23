@@ -1,7 +1,8 @@
-import { isolateHistory } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, insertNewline, isolateHistory } from '@codemirror/commands'
 import type { ChangeDesc, Text } from '@codemirror/state'
-import type { EditorView } from '@codemirror/view'
+import { EditorView, keymap } from '@codemirror/view'
 import { isChinese } from '../ui-language'
+import { tableCellDraftPreview } from './live-preview'
 import { sourceForTableCell, tableCellChange } from './table-source'
 
 interface CellAddress {
@@ -14,7 +15,8 @@ interface CellEdit {
   doc: Text
   table: HTMLTableElement
   cell: HTMLTableCellElement
-  input: HTMLTextAreaElement
+  overlay: HTMLElement
+  input: EditorView
   target: NonNullable<ReturnType<typeof sourceForTableCell>>
 }
 
@@ -32,9 +34,9 @@ export function finishCellEdit(view: EditorView, confirm = true): { position: nu
   if (!edit) return null
   activeEdits.delete(view)
   tableOwners.delete(edit.table)
-  edit.input.blur()
-  const value = edit.input.value
-  edit.input.remove()
+  const value = edit.input.state.doc.toString()
+  edit.input.destroy()
+  edit.overlay.remove()
   edit.cell.classList.remove('cm-md-table-cell-editing')
 
   if (!confirm || view.state.readOnly || view.state.doc !== edit.doc) return null
@@ -50,6 +52,13 @@ export function finishCellEdit(view: EditorView, confirm = true): { position: nu
     if (viewport) viewport.scrollLeft = scrollLeft
   }
   return { position: change.from, changes: transaction.changes }
+}
+
+export function editedCellSelection(view: EditorView): string | null {
+  const state = activeEdits.get(view)?.input.state
+  if (!state) return null
+  const { from, to } = state.selection.main
+  return state.sliceDoc(from, to)
 }
 
 export function finishRemovedTableEdit(table: HTMLElement): void {
@@ -91,17 +100,27 @@ function openCell(view: EditorView, table: HTMLTableElement, cell: HTMLTableCell
   if (view.state.readOnly || !table.isConnected) return false
   const target = sourceForTableCell(table, cell)
   if (!target) return false
-  const input = document.createElement('textarea')
-  input.className = 'cm-md-table-cell-input'
-  input.setAttribute('aria-label', isChinese() ? '编辑表格单元格' : 'Edit table cell')
-  input.value = target.cell?.text ?? ''
-  const edit = { doc: view.state.doc, table, cell, input, target }
+  const text = target.cell?.text ?? ''
+  const overlay = document.createElement('div')
+  overlay.className = 'cm-md-table-cell-input'
+  cell.classList.add('cm-md-table-cell-editing')
+  cell.append(overlay)
+  const input = new EditorView({
+    doc: text,
+    selection: { anchor: text.length },
+    parent: overlay,
+    extensions: [
+      EditorView.contentAttributes.of({ 'aria-label': isChinese() ? '编辑表格单元格' : 'Edit table cell' }),
+      EditorView.lineWrapping,
+      tableCellDraftPreview(view.state),
+      history(),
+      keymap.of([{ key: 'Shift-Enter', run: insertNewline }, ...defaultKeymap, ...historyKeymap]),
+    ],
+  })
+  const edit = { doc: view.state.doc, table, cell, overlay, input, target }
   activeEdits.set(view, edit)
   tableOwners.set(table, view)
-  cell.classList.add('cm-md-table-cell-editing')
-  cell.append(input)
-  input.focus({ preventScroll: true })
-  input.setSelectionRange(input.value.length, input.value.length)
+  input.focus()
   const viewport = table.parentElement
   if (viewport && viewport.scrollWidth > viewport.clientWidth) {
     const { left } = viewport.getBoundingClientRect()
@@ -114,12 +133,12 @@ function openCell(view: EditorView, table: HTMLTableElement, cell: HTMLTableCell
     }
   }
 
-  input.addEventListener('blur', () => {
+  input.contentDOM.addEventListener('blur', () => {
     queueMicrotask(() => {
-      if (activeEdits.get(view) === edit && document.activeElement !== input) finishCellEdit(view)
+      if (activeEdits.get(view) === edit && !input.hasFocus) finishCellEdit(view)
     })
   })
-  input.addEventListener('keydown', (event) => {
+  input.dom.addEventListener('keydown', (event) => {
     if (event.isComposing || event.keyCode === 229) return
     if (!['Enter', 'Tab', 'Escape'].includes(event.key) || (event.key === 'Enter' && event.shiftKey)) return
     event.preventDefault()
@@ -127,7 +146,7 @@ function openCell(view: EditorView, table: HTMLTableElement, cell: HTMLTableCell
     const next = event.key === 'Tab' ? adjacentCell(edit, event.shiftKey) : null
     const result = finishCellEdit(view, event.key !== 'Escape')
     if (!next || !openAt(view, next, result?.changes)) view.focus()
-  })
+  }, true)
   return true
 }
 

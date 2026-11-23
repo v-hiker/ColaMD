@@ -1,4 +1,4 @@
-import { createEditor, focusEditor, finishTableCellEdit, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
+import { createEditor, focusEditor, finishTableCellEdit, tableCellEditSelection, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { withDiagramZoomPaused } from './editor/mermaid-bridge'
 import { jumpToSourceLine, sourcePositionTop } from './editor/source-line'
@@ -2055,16 +2055,17 @@ async function init(): Promise<void> {
     event.preventDefault()
     const target = event.target as HTMLElement | null
     const href = target?.closest('a')?.getAttribute('href') ?? ''
-    const input = sourceModeActive ? sourceEl() : target?.closest<HTMLTextAreaElement>('.cm-md-table-cell-input')
+    const input = sourceModeActive ? sourceEl() : null
+    const cellSelection = target?.closest('.cm-md-table-cell-input') ? tableCellEditSelection() : null
     const selection = input
       ? input.value.slice(input.selectionStart, input.selectionEnd)
-      : (window.getSelection()?.toString() ?? '')
+      : (cellSelection ?? window.getSelection()?.toString() ?? '')
     void window.electronAPI.showEditorContextMenu({
       selection,
       link: /^https?:/i.test(href) ? href : null,
       image: target instanceof HTMLImageElement ? target.src : null,
       // 阅读态不回传全选：那边全选选中的是文档源码区间，画出来跟看到的内容对不上
-      canSelectAll: !input && !readingModeActive,
+      canSelectAll: !input && cellSelection === null && !readingModeActive,
     })
   })
   api.onToggleSourceMode(() => toggleSourceMode())

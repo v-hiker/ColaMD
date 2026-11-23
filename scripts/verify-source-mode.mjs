@@ -515,16 +515,16 @@ try {
       await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode, modifiers })
     }
   }
+  const cellDraft = 'document.activeElement.closest(".cm-md-table-cell-input") && document.activeElement.cmTile.root.view'
   await clickCell(0)
   await send('Input.insertText', { text: ' | 备注' })
   check('表格保持渲染，输入即显示在当前格且提交前原文不变', await evaluate(`
-    document.activeElement.matches('.cm-md-table-cell-input') &&
-    document.activeElement.value === '**单元格甲** | 备注' &&
+    (${cellDraft})?.state.doc.toString() === '**单元格甲** | 备注' &&
     document.querySelector('.cm-md-table-widget tbody td:nth-child(2)').textContent === '单元格乙' &&
     v.state.doc.toString() === ${JSON.stringify(readingEdited)}
   `))
   const cellThemes = await evaluate(`(() => {
-    const input = document.activeElement
+    const input = document.activeElement.closest('.cm-md-table-cell-input')
     const original = [...document.body.classList].find(name => name.startsWith('theme-'))
     const colors = []
     for (const theme of ['light', 'dark']) {
@@ -532,7 +532,9 @@ try {
       document.body.classList.add('theme-' + theme)
       const box = input.getBoundingClientRect()
       const cell = input.parentElement.getBoundingClientRect()
-      colors.push({ background: getComputedStyle(input).backgroundColor, aligned: Math.abs(box.width - cell.width) < 3 })
+      const widthDelta = Math.abs(box.width - cell.width)
+      const heightDelta = Math.abs(box.height - cell.height)
+      colors.push({ background: getComputedStyle(input).backgroundColor, aligned: widthDelta < 3 && heightDelta < 3, widthDelta, heightDelta })
       document.body.classList.remove('theme-' + theme)
     }
     if (original) document.body.classList.add(original)
@@ -546,18 +548,39 @@ try {
     v.state.doc.toString() === ${JSON.stringify(cellEdited)} &&
     document.querySelector('.cm-md-table-widget tbody tr').cells.length === 2 &&
     document.querySelector('.cm-md-table-widget tbody td').textContent === '单元格甲 | 备注' &&
-    document.activeElement.matches('.cm-md-table-cell-input') && document.activeElement.value === '单元格乙'
+    (${cellDraft})?.state.doc.toString() === '单元格乙'
   `))
   await send('Input.insertText', { text: '放弃的输入' })
+  await pressEditorKey('Enter', 13, 8)
+  check('Shift+Enter 在当前格草稿内换行', await evaluate(
+    `(${cellDraft})?.state.doc.toString() === ${JSON.stringify('单元格乙放弃的输入\n')}`,
+  ))
   await pressEditorKey('Escape', 27)
   check('Esc 取消当前格的输入', await evaluate(`!document.querySelector('.cm-md-table-cell-input') &&
     v.state.doc.toString() === ${JSON.stringify(cellEdited)}`))
 
   await clickCell(1)
-  await evaluate(`document.activeElement.select()`)
-  await send('Input.insertText', { text: '**新的说明**' })
+  await evaluate(`(() => { const draft = ${cellDraft}; draft.dispatch({ selection: { anchor: 0, head: draft.state.doc.length } }) })()`)
+  const editedMarkup = '**新的说明** [链接](https://example.com) 与 $x_1$ 和 ' + String.fromCharCode(96) + '字段' + String.fromCharCode(96)
+  await send('Input.insertText', { text: editedMarkup })
+  check('当前格边输入边渲染且提交前只改草稿', await evaluate(`(() => {
+    const content = document.activeElement
+    return content.querySelector('strong')?.textContent === '新的说明' &&
+      content.querySelector('.cm-md-link')?.textContent === '链接' &&
+      !!content.querySelector('.cm-md-math .katex') &&
+      content.querySelector('code')?.textContent === '字段' &&
+      v.state.doc.toString() === ${JSON.stringify(cellEdited)}
+  })()`))
+  await evaluate(`(${cellDraft}).dispatch({ selection: { anchor: 4 } })`)
+  check('只展开当前编辑的格式，格内其余标记继续渲染', await evaluate(`(() => {
+    const content = document.activeElement
+    return content.textContent.includes('**新的说明**') &&
+      content.querySelector('.cm-md-link')?.textContent === '链接' &&
+      content.querySelector('code')?.textContent === '字段' &&
+      !content.textContent.includes('https://example.com')
+  })()`))
   await pressEditorKey('Enter', 13)
-  const formattedCell = cellEdited.replace('单元格乙', '**新的说明**')
+  const formattedCell = cellEdited.replace('单元格乙', editedMarkup)
   check('Enter 确认后渲染当前格的 Markdown 格式', await evaluate(`
     v.state.doc.toString() === ${JSON.stringify(formattedCell)} &&
     document.querySelector('.cm-md-table-widget td:nth-child(2) strong')?.textContent === '新的说明'
