@@ -523,8 +523,10 @@ try {
     document.querySelector('.cm-md-table-widget tbody td:nth-child(2)').textContent === '单元格乙' &&
     v.state.doc.toString() === ${JSON.stringify(readingEdited)}
   `))
-  const cellThemes = await evaluate(`(() => {
-    const input = document.activeElement.closest('.cm-md-table-cell-input')
+  const cellThemes = await evaluate(`(async () => {
+    const content = document.activeElement
+    const input = content.closest('.cm-md-table-cell-input')
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
     const original = [...document.body.classList].find(name => name.startsWith('theme-'))
     const colors = []
     for (const theme of ['light', 'dark']) {
@@ -534,7 +536,14 @@ try {
       const cell = input.parentElement.getBoundingClientRect()
       const widthDelta = Math.abs(box.width - cell.width)
       const heightDelta = Math.abs(box.height - cell.height)
-      colors.push({ background: getComputedStyle(input).backgroundColor, aligned: widthDelta < 3 && heightDelta < 3, widthDelta, heightDelta })
+      const cursor = input.querySelector('.cm-cursor-primary')
+      const bounds = cursor?.getBoundingClientRect()
+      const cursorColor = cursor && getComputedStyle(cursor).borderLeftColor
+      const caretVisible = bounds?.width > 0 && bounds.height > 0 &&
+        bounds.left >= box.left && bounds.right <= box.right &&
+        bounds.top >= box.top && bounds.bottom <= box.bottom &&
+        cursorColor === getComputedStyle(content).color
+      colors.push({ background: getComputedStyle(input).backgroundColor, aligned: widthDelta < 3 && heightDelta < 3, widthDelta, heightDelta, caretVisible, cursorColor })
       document.body.classList.remove('theme-' + theme)
     }
     if (original) document.body.classList.add(original)
@@ -542,6 +551,7 @@ try {
   })()`)
   check('单元格输入框在浅色和深色主题中贴合网格', cellThemes.every(style => style.aligned) &&
     cellThemes[0].background !== cellThemes[1].background, cellThemes)
+  check('编辑单元格时光标在深浅主题中可见', cellThemes.every(style => style.caretVisible), cellThemes)
   await pressEditorKey('Tab', 9)
   const cellEdited = readingEdited.replace('**单元格甲**', '**单元格甲** \\| 备注')
   check('Tab 确认后只写回当前格，竖线显示为文字并进入下一格', await evaluate(`

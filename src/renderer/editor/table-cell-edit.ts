@@ -1,6 +1,6 @@
 import { defaultKeymap, history, historyKeymap, insertNewline, isolateHistory } from '@codemirror/commands'
 import type { ChangeDesc, Text } from '@codemirror/state'
-import { EditorView, keymap } from '@codemirror/view'
+import { drawSelection, EditorView, keymap } from '@codemirror/view'
 import { isChinese } from '../ui-language'
 import { tableCellDraftPreview } from './live-preview'
 import { sourceForTableCell, tableCellChange } from './table-source'
@@ -111,6 +111,7 @@ function openCell(view: EditorView, table: HTMLTableElement, cell: HTMLTableCell
     parent: overlay,
     extensions: [
       EditorView.contentAttributes.of({ 'aria-label': isChinese() ? '编辑表格单元格' : 'Edit table cell' }),
+      drawSelection(),
       EditorView.lineWrapping,
       tableCellDraftPreview(view.state),
       history(),
