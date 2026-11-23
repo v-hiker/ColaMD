@@ -1479,6 +1479,7 @@ function togglePanel(): void {
   manualHidden = !manualHidden
   localStorage.setItem('file-panel-hidden', manualHidden ? '1' : '0')
   updatePanelVisibility()
+  scheduleOutlineUpdate()
 }
 
 // Drag the panel's inner edge to resize it; the width clamps to the
@@ -2088,12 +2089,12 @@ async function init(): Promise<void> {
     updateWordCount()
     scheduleOutlineUpdate()
   })
-  // The outline tracks scrolling in both modes so it doubles as a progress
-  // view (#64); rAF keeps the rect reads to one batch per frame. `scrollend`
-  // also releases the outline jump lock as soon as a jump scroll settles.
-  editorEl().addEventListener('scroll', scheduleOutlineActiveSync, { passive: true })
+  // Listen on CodeMirror's scroll container. `scrollend` releases the outline
+  // jump lock when scrolling settles.
+  const scroller = editorScroller()
+  scroller.addEventListener('scroll', scheduleOutlineActiveSync, { passive: true })
   sourceEl().addEventListener('scroll', scheduleOutlineActiveSync, { passive: true })
-  editorEl().addEventListener('scrollend', endOutlineJump)
+  scroller.addEventListener('scrollend', endOutlineJump)
   sourceEl().addEventListener('scrollend', endOutlineJump)
   // Anchor-link jumps start inside the editor; the phase signal engages the
   // same jump lock the outline clicks use, so the highlight cannot be stolen
