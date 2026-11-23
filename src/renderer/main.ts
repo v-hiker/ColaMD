@@ -1,3 +1,5 @@
+import { forceParsing } from '@codemirror/language'
+import type { ImageExportDestination } from '../preload/index'
 import { createEditor, focusEditor, finishTableCellEdit, tableCellEditSelection, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { withDiagramZoomPaused } from './editor/mermaid-bridge'
@@ -7,7 +9,7 @@ import { EditorView } from '@codemirror/view'
 import { documentHTMLFrom } from './editor/clean-html'
 import { isPresenting, startSlideshow, stopSlideshow } from './slideshow'
 import { enterPrintLayout, exitPrintLayout } from './slides-export'
-import { enterPaperLayout, exitPaperLayout } from './print-layout'
+import { enterPaperLayout, exitPaperLayout, preparePdfDocument, type PdfPageWidths } from './print-layout'
 import { SearchPanel } from './editor/search-panel'
 import { applyTheme, loadSavedTheme } from './themes/theme-manager'
 import { setUiLanguage, isChinese, type UiLanguage } from './ui-language'
@@ -1711,6 +1713,37 @@ function getFileContent(): string {
   return activeFrontmatter + (activeLineEnding === '\r\n' ? body.replace(/\r?\n/g, '\r\n') : body)
 }
 
+async function withExportProgress(run: () => Promise<unknown>): Promise<void> {
+  const progress = document.getElementById('export-progress')!
+  if (!progress.hidden) return
+
+  progress.setAttribute('aria-label', isChinese() ? '正在导出' : 'Exporting')
+  progress.hidden = false
+  try {
+    if (!document.hidden) {
+      // Give the progress bar a paint before synchronous document preparation.
+      await new Promise<void>((resolve) => {
+        let frame: number
+        const timer = window.setTimeout(() => {
+          cancelAnimationFrame(frame)
+          resolve()
+        }, 100)
+        frame = requestAnimationFrame(() => {
+          frame = requestAnimationFrame(() => {
+            clearTimeout(timer)
+            resolve()
+          })
+        })
+      })
+    }
+    await run()
+  } catch (error) {
+    console.error('Export failed', error)
+  } finally {
+    progress.hidden = true
+  }
+}
+
 /**
  * 导出前把编辑器的痕迹收起来，导出后放回去。
  *
@@ -1807,23 +1840,33 @@ async function exportCurrentHTML(): Promise<void> {
   }
 }
 
-async function exportCurrentImage(preset: 'desktop' | 'mobile'): Promise<void> {
+async function exportCurrentImage(preset: 'desktop' | 'mobile', destination: ImageExportDestination): Promise<void> {
   finishTableCellEdit()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
 
-  if (wasSourceMode) {
-    exitSourceMode()
-    setMarkdownProgrammatically(content)
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-    })
+  let snapshot: ReturnType<typeof getExportSnapshot>
+  try {
+    if (wasSourceMode) {
+      exitSourceMode()
+      setMarkdownProgrammatically(content)
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      })
+    }
+    // 图片快照会一次取走整篇 DOM，需要先补齐视口外的 Markdown 解析。
+    const view = getEditorView()
+    if (view) forceParsing(view, view.state.doc.length, 5000)
+    if (destination === 'file') {
+      await withExportLayout(() => window.electronAPI.exportImage(getExportSnapshot(content), preset, destination))
+      return
+    }
+    snapshot = await withExportLayout(async () => getExportSnapshot(content))
+  } finally {
+    if (wasSourceMode) enterSourceMode(content, sourceScrollRatio)
   }
-
-  await withExportLayout(() => window.electronAPI.exportImage(getExportSnapshot(content), preset))
-
-  if (wasSourceMode) enterSourceMode(content, sourceScrollRatio)
+  await window.electronAPI.exportImage(snapshot, preset, destination)
 }
 
 // 导出幻灯片 PDF: the file and the dialog belong to the main process, so it
@@ -1861,9 +1904,16 @@ window.__colamdExportDocumentHTML = (): string => {
 }
 
 window.__colamdPrintExport = {
-  enter: async () => {
+  enter: async (pageWidths?: PdfPageWidths) => {
+    finishTableCellEdit()
+    if (sourceModeActive) setMarkdownProgrammatically(sourceEl().value)
+    const view = getEditorView()
+    if (pageWidths && view && !forceParsing(view, view.state.doc.length, 5000)) {
+      throw new Error('The document could not be fully parsed for PDF export')
+    }
     setCleanExport(true)
     await enterPaperLayout()
+    return pageWidths ? preparePdfDocument(pageWidths) : false
   },
   exit: () => {
     exitPaperLayout()
@@ -2118,17 +2168,18 @@ async function init(): Promise<void> {
 
   api.onMenuSave(() => { void saveCurrent() })
   api.onMenuSaveAs(() => { void saveCurrent(true) })
-  api.onMenuExportPDF(() => api.exportPDF())
-  api.onMenuExportHTML(() => { void exportCurrentHTML() })
-  api.onMenuExportDOCX(async () => {
+  api.onMenuExportPDF(() => withExportProgress(() => api.exportPDF()))
+  api.onMenuExportSlidesPDF(() => withExportProgress(() => api.exportSlidesPDF()))
+  api.onMenuExportHTML(() => withExportProgress(exportCurrentHTML))
+  api.onMenuExportDOCX(() => withExportProgress(async () => {
     // Diagrams are drawn again for the page rather than reused from the screen
     // (src/renderer/editor/mermaid-export.ts), so this awaits a render per
     // diagram before the save dialog opens.
     finishTableCellEdit()
-    const payload = await markdownForWord(getContent(), isChinese())
+    const payload = await markdownForWord(getContent(), currentFilePath)
     await api.exportDOCX(payload)
-  })
-  api.onMenuExportImage((preset) => { void exportCurrentImage(preset) })
+  }))
+  api.onMenuExportImage((preset, destination) => withExportProgress(() => exportCurrentImage(preset, destination)))
   api.onMenuPlaySlideshow(() => { void toggleSlideshow() })
 
   api.onNewFile(() => {

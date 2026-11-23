@@ -1,62 +1,67 @@
-// Mermaid diagrams for the Word export.
-//
-// Word is a white page, so every diagram that goes into a .docx is rendered
-// again with a light palette inlined into the SVG, even when the app is in a dark
-// theme. The
-// SVG on screen is deliberately not reused: it may belong to a dark theme, and
-// in source mode (or on a block whose source is open for editing) there is no
-// SVG on screen at all, yet the export can still draw one.
-//
-// The Word pipeline is Markdown based (src/main/docx-export.ts parses the text
-// and only understands images that point at a real file), so each diagram is
-// burned into a PNG here and the fence is rewritten into an image reference that
-// names it in `images`. A diagram that cannot be drawn keeps its code fence: an
-// export never fails because one diagram did.
-
+import { currentWordTheme } from '../word-theme'
+import {
+  WORD_CONTENT_WIDTH, WORD_DIAGRAM_HEIGHT, WORD_TWIPS_PER_PIXEL,
+  type WordExportPayload, type WordTheme,
+} from '../../shared/word-export'
 import { renderMermaid } from './mermaid-bridge'
 
-const MERMAID_FENCE = /^([ \t]*)```[ \t]*mermaid[ \t]*\r?\n([\s\S]*?)^\1```[ \t]*$/gm
-
-export interface WordExportPayload {
-  content: string
-  images: Record<string, string>
+interface Diagram {
+  svg: Element
+  width: number
+  height: number
 }
 
-// Mermaid gives the SVG a viewBox and often a `width="100%"` style, which an
-// <img> cannot size from. Pin the natural size on a copy before serialising.
-async function diagramPNG(code: string): Promise<string | null> {
-  const svg = await renderMermaid(code, { print: true })
-  const root = new DOMParser().parseFromString(svg, 'image/svg+xml').documentElement
-  if (!root || root.nodeName !== 'svg') return null
+async function drawDiagram(code: string, palette: Record<string, string>): Promise<Diagram | null> {
+  const source = await renderMermaid(code, { palette })
+  const svg = new DOMParser().parseFromString(source, 'image/svg+xml').documentElement
+  if (svg.localName !== 'svg') return null
 
-  const viewBox = (root.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number)
-  const width = viewBox.length === 4 && viewBox.every(Number.isFinite)
-    ? viewBox[2]
-    : Number.parseFloat(root.getAttribute('width') ?? '')
-  const height = viewBox.length === 4 && viewBox.every(Number.isFinite)
-    ? viewBox[3]
-    : Number.parseFloat(root.getAttribute('height') ?? '')
-  if (!(width > 0) || !(height > 0)) return null
+  const [,, width, height] = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number)
+  if (!(Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0)) return null
+  svg.setAttribute('width', String(width))
+  svg.setAttribute('height', String(height))
+  return { svg, width, height }
+}
 
-  root.setAttribute('width', String(width))
-  root.setAttribute('height', String(height))
-  root.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
-  const source = new XMLSerializer().serializeToString(root)
+function paperPalette(theme: WordTheme): Record<string, string> {
+  return {
+    '--pele-bg': '#ffffff',
+    '--pele-fg': '#' + theme.text,
+    '--pele-muted': '#' + theme.text,
+    '--pele-line': '#' + theme.text,
+    '--pele-surface': '#' + theme.tableHeader,
+    '--pele-surface-alt': '#' + theme.codeBackground,
+    '--pele-border': '#' + theme.border,
+    '--pele-accent': '#' + theme.accent,
+  }
+}
 
+async function diagramPNG(code: string, palette: Record<string, string>): Promise<string | null> {
+  let diagram = await drawDiagram(code, palette)
+  if (!diagram) return null
+  const pageWidth = WORD_CONTENT_WIDTH / WORD_TWIPS_PER_PIXEL
+  const scaleOnPage = ({ width, height }: Diagram) => Math.min(pageWidth / width, WORD_DIAGRAM_HEIGHT / height)
+
+  // Very wide left-to-right flowcharts have tiny labels on a portrait page.
+  // Try a vertical layout for the embedded image and keep the larger result.
+  if (diagram.width > pageWidth * 1.65 && diagram.width / diagram.height > 3) {
+    const verticalCode = code.replace(/^(\s*(?:flowchart|graph)[ \t]+)(LR|RL)\b/m,
+      (_, start, direction) => start + (direction === 'LR' ? 'TB' : 'BT'))
+    if (verticalCode !== code) {
+      const vertical = await drawDiagram(verticalCode, palette).catch(() => null)
+      if (vertical && scaleOnPage(vertical) > scaleOnPage(diagram)) diagram = vertical
+    }
+  }
+
+  const source = new XMLSerializer().serializeToString(diagram.svg)
   const image = new Image()
-  const decoded = new Promise<boolean>((resolve) => {
-    image.onload = () => resolve(true)
-    image.onerror = () => resolve(false)
-  })
-  image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`
-  if (!(await decoded)) return null
+  image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(source)
+  await image.decode()
 
-  // Twice the natural size: the docx scales the image down to fit the page, and
-  // the extra pixels are what keep the labels sharp in print.
-  const scale = 2
+  const scale = Math.min(2, 4096 / Math.max(diagram.width, diagram.height))
   const canvas = document.createElement('canvas')
-  canvas.width = Math.max(1, Math.round(width * scale))
-  canvas.height = Math.max(1, Math.round(height * scale))
+  canvas.width = Math.max(1, Math.round(diagram.width * scale))
+  canvas.height = Math.max(1, Math.round(diagram.height * scale))
   const context = canvas.getContext('2d')
   if (!context) return null
   context.fillStyle = '#ffffff'
@@ -65,37 +70,16 @@ async function diagramPNG(code: string): Promise<string | null> {
   return canvas.toDataURL('image/png')
 }
 
-export async function markdownForWord(markdown: string, chinese: boolean): Promise<WordExportPayload> {
-  const fences: Array<{ start: number; end: number; code: string }> = []
-  MERMAID_FENCE.lastIndex = 0
-  for (let match = MERMAID_FENCE.exec(markdown); match; match = MERMAID_FENCE.exec(markdown)) {
-    const indent = match[1] ?? ''
-    const body = match[2] ?? ''
-    fences.push({
-      start: match.index,
-      end: match.index + match[0].length,
-      code: (indent ? body.replace(new RegExp(`^${indent}`, 'gm'), '') : body).trimEnd(),
-    })
-  }
-  if (fences.length === 0) return { content: markdown, images: {} }
-
-  const images: Record<string, string> = {}
-  const pieces: string[] = []
-  let cursor = 0
-  let index = 0
-  for (const fence of fences) {
-    index += 1
-    const name = `colamd-diagram-${index}.png`
-    const png = await diagramPNG(fence.code).catch(() => null)
-    pieces.push(markdown.slice(cursor, fence.start))
-    if (png) {
-      images[name] = png
-      pieces.push(`![${chinese ? '示意图' : 'Diagram'}](${name})`)
-    } else {
-      pieces.push(markdown.slice(fence.start, fence.end))
+export async function markdownForWord(content: string, sourcePath: string | null): Promise<WordExportPayload> {
+  const theme = currentWordTheme()
+  const diagrams: Record<string, string> = Object.create(null)
+  if (/\bmermaid\b/i.test(content)) {
+    const parser = await import('../../shared/word-markdown')
+    const palette = paperPalette(theme)
+    for (const code of new Set(parser.mermaidBlocks(parser.parseWordMarkdown(content)))) {
+      const png = await diagramPNG(code, palette).catch(() => null)
+      if (png) diagrams[code] = png
     }
-    cursor = fence.end
   }
-  pieces.push(markdown.slice(cursor))
-  return { content: pieces.join(''), images }
+  return { content, diagrams, theme, sourcePath }
 }

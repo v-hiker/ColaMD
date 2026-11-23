@@ -184,11 +184,12 @@ async function captureReadingPage(
   return image.toPNG()
 }
 
-// One image per document when it fits, otherwise one per reading page. The
-// caller writes one file for one image, and numbered files for several.
+// A document that exceeds the capture surface can still be saved as numbered
+// reading pages. Clipboard export needs a single complete image.
 export async function renderDocumentImages(
   snapshot: ImageExportSnapshot,
-  preset: ImageExportPreset
+  preset: ImageExportPreset,
+  { singleImageOnly = false } = {}
 ): Promise<Buffer[]> {
   const { width, height: pageHeight } = PRESETS[preset]
   const win = new BrowserWindow({
@@ -221,6 +222,7 @@ export async function renderDocumentImages(
 
     const single = await captureWholeDocument(win, dimensions, pageHeight)
     if (single) return [single]
+    if (singleImageOnly) return []
 
     const pages: Buffer[] = []
     for (let offset = 0; offset < dimensions.height; offset += pageHeight) {

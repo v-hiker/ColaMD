@@ -403,6 +403,7 @@ body.reading-mode .cm-content .cm-md-table-widget ::selection {
 }
 
 .cm-content .cm-md-codeblock-first:hover .code-copy-btn,
+.cm-content .cm-md-codeblock-first:has(.code-language-btn) .code-copy-btn,
 .cm-content .code-copy-btn:focus-visible,
 .cm-content .code-copy-btn.copied {
   opacity: 1;
@@ -412,6 +413,35 @@ body.reading-mode .cm-content .cm-md-table-widget ::selection {
 .cm-content .code-copy-btn.copied {
   background: color-mix(in srgb, var(--text-color) 14%, transparent);
   color: var(--text-color);
+}
+
+.cm-content .code-language-btn {
+  position: absolute;
+  inset-block-start: 4px;
+  inset-inline-end: 6px;
+  z-index: 1;
+  max-inline-size: calc(100% - 12px);
+  padding: 2px 5px;
+  border: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--code-block-text, var(--text-color)) 82%, var(--code-block-bg));
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.cm-content .cm-md-codeblock-first:has(.code-copy-btn) .code-language-btn {
+  inset-inline-end: 72px;
+  max-inline-size: calc(100% - 78px);
+}
+
+.cm-content .code-language-btn:hover {
+  color: var(--code-block-text, var(--text-color));
+  text-decoration: underline;
 }
 
 /* ======= 链接 ======= */

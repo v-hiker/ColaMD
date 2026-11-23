@@ -18,7 +18,7 @@ import { keymap } from '@codemirror/view'
 import { markdownHighlightStyle } from './source-theme'
 import { frontmatterRange } from './math-scan'
 import { renumberLists } from './list-renumber'
-import { cjkEmphasis } from './cjk-emphasis'
+import { cjkEmphasis } from '../../shared/cjk-emphasis'
 
 /** 可编辑性放在一个 compartment 里，方便运行时切换而不重建编辑器。 */
 export const editableCompartment = new Compartment()

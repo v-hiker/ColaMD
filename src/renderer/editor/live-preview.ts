@@ -28,6 +28,7 @@ import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
 import { decodeString } from 'micromark-util-decode-string'
 import { markdownParser } from './state'
+import { documentHeadings } from './heading-anchor'
 import { scanMath, excludedRanges, frontmatterRange, type Excluded, type MathRange } from './math-scan'
 import { renderMermaid, attachDiagramZoom, detachDiagramZoom, isDiagramZoomed } from './mermaid-bridge'
 import { sanitizeHTML, cleanStyle, isSafeURL } from './html-sanitize'
@@ -991,12 +992,11 @@ export function tableCellDraftPreview(parent: EditorState): Extension {
     const formulas = scanMath(text, excludedRanges(text, tree))
       .filter(({ from, to }) => state.doc.lineAt(from).number === state.doc.lineAt(to).number)
     const ranges: StateRange<Decoration>[] = []
-    const active = (from: number, to: number) => state.selection.ranges.some(range => range.from < to && range.to > from)
     const replace = (from: number, to: number, widget?: WidgetType) =>
       ranges.push(Decoration.replace({ widget }).range(from, to))
 
     for (const { from, to, code } of formulas) {
-      if (!active(from, to)) replace(from, to, new MathWidget(displayCellText(code), false, from, to))
+      replace(from, to, new MathWidget(displayCellText(code), false, from, to))
     }
 
     tree.iterate({ enter(ref) {
@@ -1005,28 +1005,24 @@ export function tableCellDraftPreview(parent: EditorState): Extension {
       if (formulas.some(formula => formula.from < to && from < formula.to && (from >= formula.from || to <= formula.to))) return false
       const tag = cellFormatTags[name]
       if (tag) {
-        if (!active(from, to)) {
-          const first = node.firstChild
-          const last = node.lastChild
-          if (first && last && first.to < last.from) {
-            replace(from, first.to)
-            replace(last.from, to)
-            ranges.push(MARK({ tagName: tag }).range(first.to, last.from))
-          }
+        const first = node.firstChild
+        const last = node.lastChild
+        if (first && last && first.to < last.from) {
+          replace(from, first.to)
+          replace(last.from, to)
+          ranges.push(MARK({ tagName: tag }).range(first.to, last.from))
         }
         if (name === 'InlineCode') return false
       } else if (name === 'Link') {
         const [open, close] = node.getChildren('LinkMark')
-        if (node.getChild('URL') && open && close && open.to < close.from && !active(from, to)) {
+        if (node.getChild('URL') && open && close && open.to < close.from) {
           replace(from, open.to)
           replace(close.from, to)
           ranges.push(MARK({ class: 'cm-md-link' }).range(open.to, close.from))
         }
       } else if (name === 'Image' || name === 'Autolink' || name === 'Escape' || name === 'Entity' ||
           (name === 'HTMLTag' && /^<br\s*\/?>$/i.test(text.slice(from, to)))) {
-        if (!active(from, to)) {
-          replace(from, to, new TableCellInlineWidget({ from, to, syntax: node.parent ?? undefined, text: text.slice(from, to) }, base))
-        }
+        replace(from, to, new TableCellInlineWidget({ from, to, syntax: node.parent ?? undefined, text: text.slice(from, to) }, base))
         return false
       }
     } })
@@ -1034,7 +1030,8 @@ export function tableCellDraftPreview(parent: EditorState): Extension {
   }
   return StateField.define({
     create: decorate,
-    update: (decorations, tr) => tr.docChanged || tr.selection ? decorate(tr.state) : decorations,
+    // The cell follows the document's inline rendering rule across caret moves.
+    update: (decorations, tr) => tr.docChanged ? decorate(tr.state) : decorations,
     provide: field => EditorView.decorations.from(field),
   })
 }
@@ -1278,6 +1275,41 @@ class CodeCopyWidget extends WidgetType {
   }
 }
 
+class CodeLanguageWidget extends WidgetType {
+  constructor(readonly name: string, readonly from: number, readonly to: number) {
+    super()
+  }
+
+  eq(other: CodeLanguageWidget): boolean {
+    return other.name === this.name && other.from === this.from && other.to === this.to
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.tabIndex = -1
+    button.className = 'code-language-btn'
+    button.textContent = this.name || (isChinese() ? '语言' : 'Language')
+    button.title = isChinese() ? '修改代码块语言' : 'Edit code block language'
+    button.setAttribute('aria-label', this.name ? `${button.title} ${this.name}` : button.title)
+    button.addEventListener('mousedown', (event) => event.preventDefault())
+    button.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      view.dispatch({ selection: { anchor: this.from, head: this.to }, scrollIntoView: true })
+      view.focus()
+    })
+    return button
+  }
+}
+
+function codeFenceEdit(state: EditorState, from: number, to: number): 'opening' | 'body' | undefined {
+  const head = state.selection.main.head
+  if (head <= from || head > to || state.readOnly || !editorFocused(state) ||
+      exportingCleanly(state) || !isBlockActive(state, from, to)) return
+  return head <= state.doc.lineAt(from).to ? 'opening' : 'body'
+}
+
 /** 围栏里的代码：去掉开头那一行（` ```lang `）与收尾那一行。 */
 function codeInsideFence(state: EditorState, node: SyntaxNodeRef): string {
   const startLine = state.doc.lineAt(node.from).number
@@ -1310,7 +1342,7 @@ function collectImages(state: EditorState, ranges: DecorationRange[], front: Ran
 
 // ─── 引用块与分隔线 ──────────────────────────────────────────────────────────
 
-function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
+function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Range | null, zones: ActiveZone[]): void {
   iterateContent(state, front, (node) => {
     switch (node.name) {
       case 'Blockquote': {
@@ -1364,17 +1396,28 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
         break
       }
       case 'FencedCode': {
+        const startLine = state.doc.lineAt(node.from)
+        zones.push({ from: node.from, to: node.to, kind: 'fence' })
+        if (codeFenceEdit(state, node.from, node.to) === 'body') {
+          const info = node.node.getChild('CodeInfo')
+          const name = info ? /^\S*/.exec(state.sliceDoc(info.from, info.to))?.[0] ?? '' : ''
+          const editFrom = info?.from ?? startLine.to
+          ranges.push({
+            from: startLine.to,
+            to: startLine.to,
+            deco: Decoration.widget({ widget: new CodeLanguageWidget(name, editFrom, editFrom + name.length), side: 1 }),
+          })
+        }
         // 右上角的复制按钮挂在第一行（围栏那一行）末尾，鼠标悬停代码块时才显形。
         // 导出态不加：导出的是一篇文档，不是编辑器此刻的样子。
         const code = exportingCleanly(state) ? '' : codeInsideFence(state, node)
         if (code !== '') {
           ranges.push({
-            from: state.doc.lineAt(node.from).to,
-            to: state.doc.lineAt(node.from).to,
+            from: startLine.to,
+            to: startLine.to,
             deco: Decoration.widget({ widget: new CodeCopyWidget(code), side: 1 }),
           })
         }
-        const startLine = state.doc.lineAt(node.from)
         const endLine = state.doc.lineAt(Math.max(node.from, node.to - 1))
         // 每一行都加底色，首行与末行额外加圆角，拼出一个代码块的外形
         for (let n = startLine.number; n <= endLine.number; n++) {
@@ -1490,12 +1533,15 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
               !isBlockActive(state, fence.from, fence.to) &&
               /^(`{3,}|~{3,})\s*mermaid\s*$/.test(state.doc.sliceString(fence.from, state.doc.lineAt(fence.from).to).trim()) &&
               codeInsideFence(state, fence).trim()) break
-          ranges.push({ from, to, deco: active ? MARK({ class: 'cm-md-marker' }) : hide(from, to) })
+          const showFence = node.name === 'CodeMark' && fence?.name === 'FencedCode' &&
+            from === fence.from && codeFenceEdit(state, fence.from, fence.to) === 'opening'
+          ranges.push({ from, to, deco: active || showFence ? MARK({ class: 'cm-md-marker' }) : hide(from, to) })
           break
         }
         case 'CodeInfo': {
-          // 围栏上的语言名（```js 里的 js）。压淡，让它读起来是标注而不是代码。
-          ranges.push({ from, to, deco: MARK({ class: 'cm-md-codeinfo' }) })
+          const fence = node.node.parent
+          const editing = fence?.name === 'FencedCode' && codeFenceEdit(state, fence.from, fence.to) === 'opening'
+          ranges.push({ from, to, deco: editing ? MARK({ class: 'cm-md-codeinfo' }) : hide(from, to) })
           break
         }
         case 'HeaderMark': {
@@ -1600,7 +1646,7 @@ let currentFlash: { from: number; to: number } | null = null
 interface ActiveZone {
   from: number
   to: number
-  kind: 'frontmatter' | 'block'
+  kind: 'frontmatter' | 'block' | 'fence'
 }
 
 const zonesByDeco = new WeakMap<DecorationSet, ActiveZone[]>()
@@ -1615,6 +1661,9 @@ function activeZonesKey(state: EditorState, zones: readonly ActiveZone[]): strin
     if (z.kind === 'frontmatter') {
       const hit = state.selection.ranges.some((r) => r.empty && r.head >= z.from && r.head <= z.to)
       if (hit) parts.push(`f:${z.from}:${z.to}`)
+    } else if (z.kind === 'fence') {
+      const editing = codeFenceEdit(state, z.from, z.to)
+      if (editing) parts.push(`${editing}:${z.from}:${z.to}`)
     } else if (main.from >= z.from && main.to <= z.to) {
       parts.push(`b:${z.from}:${z.to}`)
     }
@@ -1631,11 +1680,20 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
   // 不让它的 `---` 被当成分页。
   const front = frontmatterRange(text)
 
+  // Chromium's tagged PDF uses accessible headings for native outline destinations.
+  if (exportingCleanly(state)) {
+    for (const { level, title, line } of documentHeadings(text)) {
+      const from = state.doc.line(line + 1).from
+      const deco = Decoration.line({ attributes: { role: 'heading', 'aria-level': String(level), 'aria-label': title } })
+      ranges.push({ from, to: from, deco })
+    }
+  }
+
   if (flash && flash.to <= state.doc.length) {
     ranges.push({ from: flash.from, to: flash.to, deco: MARK({ class: 'cm-md-jump-flash' }) })
   }
 
-  collectBlocks(state, ranges, front)
+  collectBlocks(state, ranges, front, zones)
   collectLinks(state, ranges, front)
   collectFootnotes(state, text, ranges, front)
   collectHTML(state, ranges, front, zones)
@@ -1685,7 +1743,8 @@ export const livePreviewField = StateField.define<DecorationSet>({
     const wasClean = tr.startState.field(cleanExportField, false) ?? false
     const readingChanged = readingMode(tr.state) !== readingMode(tr.startState)
     if (!tr.docChanged && !flash && !parsed && !rebased && clean === wasClean && !readingChanged) {
-      if (!tr.selection) return deco
+      if (!tr.selection && editorFocused(tr.state) === editorFocused(tr.startState) &&
+          tr.state.readOnly === tr.startState.readOnly) return deco
       const zones = zonesByDeco.get(deco) ?? []
       if (activeZonesKey(tr.state, zones) === activeZonesKey(tr.startState, zones)) {
         return deco

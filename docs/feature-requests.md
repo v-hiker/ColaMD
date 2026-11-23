@@ -72,6 +72,26 @@ The rendered text and outline decode Markdown escapes and character references u
 
 Tables share the document's inline Markdown parser for escapes, nested formatting and code. Setext headings appear in the editor and outline and export at their original level. Inline link destinations resolve escaped punctuation and character references.
 
+### PDF outline bookmarks
+
+PDF export preserves the rendered document and includes native bookmarks derived from the document headings, including nested and Setext headings.
+
+### Adaptive PDF table widths
+
+PDF export measures Markdown text tables at paper width. Short labels and values use compact columns, comparable descriptions share the remaining width, and unusually long values can wrap. A table whose columns need more room than portrait A4 provides switches the document to landscape A4.
+
+### Theme-aware Word export
+
+Word export uses the active theme's installed fonts, heading sizes, and paper colors with native headings, text, and tables. Quotes use the theme's border and preserve Chinese emphasis around punctuation. Tables fit the page and repeat their headers. Local and embedded images keep their captions and fit the page or cell. Mermaid diagrams use a paper palette, and very wide horizontal flowcharts can turn vertically when that makes their labels more legible.
+
+### Copy exported images to the clipboard
+
+The File menu copies the rendered document as a PNG using the desktop or mobile export layout. Documents that need multiple images can be saved using the numbered image export.
+
+### Export progress
+
+A temporary progress bar at the bottom edge of the title bar shows that a document is being prepared or exported. It closes when the export finishes or is canceled.
+
 ## Implemented On Main
 
 ### Inline HTML pairs (#125)
@@ -538,12 +558,6 @@ Two- and three-page reading layouts for ultrawide displays were declined. ColaMD
 **Superseded — do not build.** This was the 2026-09-01 direction for the same need as tabs ([#59](https://github.com/marswaveai/ColaMD/issues/59)): a quiet strip below the title bar holding up to three same-directory documents. The tab strip shipped in `v2.1.0` covers that need with an explicit model instead (open a tab when you want one, the file panel keeps replacing the current document), so the switcher is closed and the prototype in `temporary-document-switcher-prototype.html` is history rather than a plan.
 
 ## Candidate
-
-### PDF outline bookmarks
-
-**Source:** [#200](https://github.com/marswaveai/ColaMD/issues/200)
-
-Worth doing, but it is not a flag. The PDF is printed from the editor's own DOM, whose headings are `div.cm-md-atxheadingN` lines rather than real `h1`–`h6` elements, and Chromium builds the outline from real heading elements only. Measured on 2026-11-07 with Electron 44: turning on `generateDocumentOutline` produced no bookmarks at all, not even for a test page that was nothing but `<h1>` (read back with `pypdf`: 0 items). So the work is an export pipeline that first converts the document to the semantic HTML we already produce for HTML export (`documentHTMLFrom`, which emits real `h` tags), then prints that. That is its own piece of work, not a release-day patch.
 
 ### Collapsible outline sections
 

@@ -8,15 +8,19 @@
 //
 // 用法: npm run verify:docx
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 
-const APP = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
-const WORK = join(homedir(), 'Library', 'Caches', 'colamd-verify', 'docx')
-rmSync(WORK, { recursive: true, force: true })
-mkdirSync(WORK, { recursive: true })
+const APP = fileURLToPath(new URL('..', import.meta.url))
+const TEMP = resolve(tmpdir())
+const WORK = mkdtempSync(join(TEMP, 'colamd-verify-docx-'))
+process.on('exit', () => {
+  if (dirname(resolve(WORK)) === TEMP) rmSync(WORK, { recursive: true, force: true })
+})
 
 let passed = 0
 let failed = 0
@@ -30,15 +34,18 @@ function check(name, ok, detail = '') {
   }
 }
 
-// 主进程模块 import 了 electron（nativeImage）。这个脚本在纯 node 里跑，给一个桩：
-// 代码块那条路径根本不碰图片，桩只需要存在。
+// OOXML checks run in Node. Supply a small PNG for the NativeImage calls.
 const stub = join(WORK, 'electron-stub.cjs')
-writeFileSync(stub, 'module.exports = { nativeImage: { createFromDataURL: () => ({ isEmpty: () => true }), createFromPath: () => ({ isEmpty: () => true }) } }\n')
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+b9ncAAAAASUVORK5CYII='
+writeFileSync(stub, `const pixel = { isEmpty: () => false, getSize: () => ({ width: 1, height: 1 }), toPNG: () => Buffer.from('${PNG}', 'base64') }
+module.exports = { nativeImage: { createFromDataURL: () => pixel } }\n`)
 const bundle = join(WORK, 'docx-export.cjs')
-execFileSync('npx', ['esbuild', join(APP, 'src/main/docx-export.ts'), '--bundle', '--platform=node',
-  '--format=cjs', `--alias:electron=${stub}`, `--outfile=${bundle}`, '--log-level=error'], { cwd: APP })
+await build({ entryPoints: [join(APP, 'src/main/docx-export.ts')], bundle: true, platform: 'node',
+  format: 'cjs', alias: { electron: stub }, outfile: bundle, logLevel: 'error' })
 
 const CODE = ['{', '  "key": "值",', '', '  "nested": {', '    "a": 1', '  }', '}'].join('\n')
+const DIAGRAM = 'flowchart LR\n  A --> B'
+const dataURL = `data:image/png;base64,${PNG}`
 const fixture = [
   '# 导出验证',
   '',
@@ -48,26 +55,40 @@ const fixture = [
   CODE,
   '```',
   '',
-  '> 引用第一段',
+  '> 引用第一段。讲透**「任务一」**与**「任务二」**在**工程**上的要求。',
   '>',
   '> 引用第二段',
+  '',
+  '| 项目 | 比较说明 |',
+  '| --- | --- |',
+  '| 序号 | 描述较长的情况需要把更多纸面宽度留给说明列。 |',
+  '',
+  '| | |',
+  '| --- | --- |',
+  `| ![表格图片甲](${dataURL}) | ![表格图片乙](${dataURL}) |`,
+  '',
+  '~~~mermaid',
+  DIAGRAM,
+  '~~~',
   '',
 ].join('\n')
 
 const require_ = createRequire(import.meta.url)
 const { markdownToDocx } = require_(bundle)
 const docxPath = join(WORK, 'out.docx')
-writeFileSync(docxPath, await markdownToDocx({ content: fixture, sourcePath: null }))
+writeFileSync(docxPath, await markdownToDocx({
+  content: fixture,
+  sourcePath: null,
+  diagrams: { [DIAGRAM]: dataURL },
+  theme: { font: 'serif', accent: '654383', tableHeader: 'EEE8F2', quoteBorder: 'D0D7DE' },
+}))
 
-let xml = ''
-try {
-  xml = execFileSync('unzip', ['-p', docxPath, 'word/document.xml']).toString('utf8')
-} catch {
-  console.log('✗ 解不开 docx（缺 unzip？）')
-  process.exitCode = 1
-  rmSync(WORK, { recursive: true, force: true })
-  process.exit()
+function readPart(part) {
+  const [command, option] = process.platform === 'win32' ? ['tar', '-xOf'] : ['unzip', '-p']
+  return execFileSync(command, [option, docxPath, part]).toString('utf8')
 }
+const xml = readPart('word/document.xml')
+const styles = readPart('word/styles.xml')
 
 // 1. 字体：代码不能写死 macOS 字体，四个槽位里要有平台等宽字体 + 中文回退
 const fontSlots = [...xml.matchAll(/<w:rFonts ([^/>]*)\/>/g)].map((m) => m[1])
@@ -94,7 +115,20 @@ check('中文注释保留', xml.includes('值'))
 check('引用两段都在，且没有挤成一段', xml.includes('引用第一段') && xml.includes('引用第二段'))
 check('标题保留', xml.includes('导出验证'))
 
-mkdirSync(WORK, { recursive: true })
-rmSync(WORK, { recursive: true, force: true })
+const quote = [...xml.matchAll(/<w:p>[\s\S]*?<\/w:p>/g)].find(([paragraph]) => paragraph.includes('引用第一段'))?.[0] ?? ''
+const bold = [...quote.matchAll(/<w:r>([\s\S]*?)<\/w:r>/g)].filter(([, run]) => /<w:b(?:\s|\/>)/.test(run))
+check('中文引号前后的粗体与编辑器一致', bold.length === 3
+  && ['「任务一」', '「任务二」', '工程'].every((value) => bold.some(([, run]) => run.includes(value)))
+  && !quote.includes('**'))
+check('引用使用常规字形与主题竖线', !/<w:i(?:\s|\/>)/.test(quote) && /w:color="D0D7DE"/.test(quote))
+
+check('正文和标题使用主题字体与链接颜色', /w:eastAsia="(?:SimSun|Songti SC|Noto Serif CJK SC)"/.test(styles)
+  && /w:color w:val="654383"/.test(styles) && /w:pStyle w:val="Heading1"/.test(xml))
+check('表格有固定列宽、主题表头和原生重复标题行', /w:tblLayout w:type="fixed"/.test(xml)
+  && /w:fill="EEE8F2"/.test(xml) && (xml.match(/<w:tblHeader\b/g) ?? []).length === 1)
+check('相邻表格之间有分隔段落', /<\/w:tbl><w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p><w:tbl>/.test(xml))
+check('表格图片及 Mermaid 为原生内嵌图，保留图片题注', (xml.match(/<w:drawing>/g) ?? []).length === 3
+  && xml.includes('表格图片甲') && !xml.includes('flowchart LR'))
+
 console.log(`\n${passed} passed / ${failed} failed`)
 if (failed > 0) process.exitCode = 1

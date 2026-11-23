@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import type { WordExportPayload } from '../shared/word-export'
 
 export interface SiblingFile {
   name: string
@@ -8,6 +9,7 @@ export interface SiblingFile {
 
 type FileOpenedData = { path: string | null; content: string; fileUrl: string | null }
 type ImageExportPreset = 'desktop' | 'mobile'
+export type ImageExportDestination = 'file' | 'clipboard'
 type ImageExportSnapshot = { html: string; styles: string; bodyClass: string; background: string }
 export type FileManagerName = 'finder' | 'explorer' | 'file-manager'
 
@@ -45,9 +47,10 @@ export interface ElectronAPI {
   saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean) => Promise<string | null>
   saveFileAs: (content: string, expectedPath?: string) => Promise<string | null>
   exportPDF: () => Promise<boolean>
+  exportSlidesPDF: () => Promise<boolean>
   exportHTML: (snapshot: { content: string; document: string; html: string; styles: string; bodyClass: string }) => Promise<boolean>
-  exportDOCX: (payload: { content: string; images: Record<string, string> }) => Promise<boolean>
-  exportImage: (snapshot: ImageExportSnapshot, preset: ImageExportPreset) => Promise<boolean>
+  exportDOCX: (payload: WordExportPayload) => Promise<boolean>
+  exportImage: (snapshot: ImageExportSnapshot, preset: ImageExportPreset, destination: ImageExportDestination) => Promise<boolean>
   getLanguage: () => Promise<'zh' | 'en'>
   onLanguageChanged: (callback: (language: 'zh' | 'en') => void) => void
   loadCustomTheme: () => Promise<{ name: string; css: string } | null>
@@ -67,9 +70,10 @@ export interface ElectronAPI {
   onMenuNewTab: (callback: () => void) => void
   onMenuCloseTab: (callback: () => void) => void
   onMenuExportPDF: (callback: () => void) => void
+  onMenuExportSlidesPDF: (callback: () => void) => void
   onMenuExportHTML: (callback: () => void) => void
   onMenuExportDOCX: (callback: () => void) => void
-  onMenuExportImage: (callback: (preset: ImageExportPreset) => void) => void
+  onMenuExportImage: (callback: (preset: ImageExportPreset, destination: ImageExportDestination) => void) => void
   onMenuPlaySlideshow: (callback: () => void) => void
   setSlideshowFullscreen: (on: boolean) => Promise<boolean>
   onSetTheme: (callback: (theme: string) => void) => void
@@ -137,9 +141,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean) => ipcRenderer.invoke('save-file', content, expectedPath, rebuildMenu, autosave),
   saveFileAs: (content: string, expectedPath?: string) => ipcRenderer.invoke('save-file-as', content, expectedPath),
   exportPDF: () => ipcRenderer.invoke('export-pdf'),
+  exportSlidesPDF: () => ipcRenderer.invoke('export-slides-pdf'),
   exportHTML: (snapshot: { content: string; document: string; html: string; styles: string; bodyClass: string }) => ipcRenderer.invoke('export-html', snapshot),
-  exportDOCX: (payload: { content: string; images: Record<string, string> }) => ipcRenderer.invoke('export-docx', payload),
-  exportImage: (snapshot: ImageExportSnapshot, preset: ImageExportPreset) => ipcRenderer.invoke('export-image', snapshot, preset),
+  exportDOCX: (payload) => ipcRenderer.invoke('export-docx', payload),
+  exportImage: (snapshot, preset, destination) => ipcRenderer.invoke('export-image', snapshot, preset, destination),
   getLanguage: () => ipcRenderer.invoke('get-language') as Promise<'zh' | 'en'>,
   onLanguageChanged: (callback: (language: 'zh' | 'en') => void) => {
     ipcRenderer.on('language-changed', (_event, language) => {
@@ -186,15 +191,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onMenuExportPDF: (callback: () => void) => {
     ipcRenderer.on('menu-export-pdf', () => callback())
   },
+  onMenuExportSlidesPDF: (callback: () => void) => {
+    ipcRenderer.on('menu-export-slides-pdf', () => callback())
+  },
   onMenuExportHTML: (callback: () => void) => {
     ipcRenderer.on('menu-export-html', () => callback())
   },
   onMenuExportDOCX: (callback: () => void) => {
     ipcRenderer.on('menu-export-docx', () => callback())
   },
-  onMenuExportImage: (callback: (preset: ImageExportPreset) => void) => {
-    ipcRenderer.on('menu-export-image', (_event, preset) => {
-      if (preset === 'desktop' || preset === 'mobile') callback(preset)
+  onMenuExportImage: (callback) => {
+    ipcRenderer.on('menu-export-image', (_event, preset, destination = 'file') => {
+      if ((preset === 'desktop' || preset === 'mobile') && (destination === 'file' || destination === 'clipboard')) {
+        callback(preset, destination)
+      }
     })
   },
   onMenuPlaySlideshow: (callback: () => void) => {

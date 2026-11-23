@@ -1476,7 +1476,7 @@ function main() {
       check('代码围栏不露源码', m.code.fenceVisible === false, `正文里还看得到围栏: ${m.code.fenceVisible}`)
       check('代码语法高亮', m.code.tokens >= 8 && m.code.colors >= 4,
         `token=${m.code.tokens} 颜色种类=${m.code.colors} 样例 ${m.code.sample}`)
-      check('语言名压淡', m.code.langLabel >= 1, `语言名标注=${m.code.langLabel}`)
+      check('正文预览收起代码块语言名', m.code.langLabel === 0, `语言名标注=${m.code.langLabel}`)
       check('代码块复制按钮', m.code.copyButton >= 1, `按钮数=${m.code.copyButton}`)
       // #154：底色压在选区层上面，代码块里选中就看不到高亮。判据是层序：
       // 行自己的底色必须透明，底色画在 z-index 更小（更靠下）的伪元素上。

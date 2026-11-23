@@ -10,12 +10,15 @@
 // 窗口放在屏幕外，测试不占用屏幕。
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { assertBuildFresh } from './build-freshness.mjs'
 import { stopVerifyApp, verifyWorkdir } from './verify-workdir.mjs'
 
-const APP = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
+const APP = fileURLToPath(new URL('..', import.meta.url))
+const electron = createRequire(import.meta.url)('electron')
 assertBuildFresh()
 const { dir: WORK, udd } = verifyWorkdir('export-pdf')
 
@@ -25,8 +28,16 @@ const ROWS = 300
 const MIN_PAGES = 5
 
 function fixture() {
-  const lines = ['# 导出验证', '']
+  const lines = [
+    '# 导出验证', '', '## 开头章节', '',
+    '| 对比维度 | 方案一 | 方案二 | 方案三 |',
+    '| --- | --- | --- | --- |',
+    '| 图纸体量 | 单张大图拆为多个子图，计算之前进一步核对有效楼层 | 按工程楼层分别核对每份图纸的编号和楼层 | 分图统计后对照详图判断有无额外构件 |',
+    '| 构件规模 | 汇总不同楼层的构件数量，逐个复核钢梁钢柱 | 单独核对构件表与图纸中标出的构件数量 | 给出混凝土梁和墙柱的分项计数与总数 |',
+    '', '```mermaid', 'flowchart LR', '  A[图纸] --> B[构件]', '```', '',
+  ]
   for (let i = 1; i <= ROWS; i++) {
+    if (i === 150) lines.push('## 后段章节', '')
     lines.push(`第 ${i} 行：这一段用来把文档撑长，检查导出的 PDF 里是不是整篇都在。`)
     lines.push('')
   }
@@ -88,8 +99,8 @@ function evaluate(client, expression) {
 function pageCount(file) {
   const raw = readFileSync(file).toString('latin1')
   const pages = (raw.match(/\/Type\s*\/Page(?![s])/g) ?? []).length
-  const declared = Number((raw.match(/\/Count\s+(\d+)/) ?? [])[1] ?? 0)
-  return { pages, declared, bytes: raw.length }
+  const hasOutline = /\/Outlines\s+\d+\s+\d+\s+R/.test(raw)
+  return { pages, bytes: raw.length, hasOutline }
 }
 
 async function main() {
@@ -100,10 +111,12 @@ async function main() {
 
   const port = 9900 + Math.floor(Math.random() * 60)
   const inspect = port + 1000
-  const child = spawn('npx', ['electron', 'scripts/offscreen-window.cjs', source, `--user-data-dir=${udd}`,
+  const env = { ...process.env }
+  delete env.ELECTRON_RUN_AS_NODE
+  const child = spawn(electron, ['scripts/offscreen-window.cjs', source, `--user-data-dir=${udd}`,
     '--force-color-profile=srgb',
     `--remote-debugging-port=${port}`, `--inspect=${inspect}`
-  ], { cwd: APP, stdio: 'ignore', detached: true })
+  ], { cwd: APP, env, stdio: 'ignore' })
 
   try {
     const page = await waitTarget(port, (t) => t.type === 'page' && /index\.html/.test(t.url))
@@ -121,6 +134,12 @@ async function main() {
       dialog.showSaveDialog = async () => ({ canceled: false, filePath: ${JSON.stringify(out)} })
       globalThis.__exportError = null
       dialog.showMessageBox = async (win, options) => { globalThis.__exportError = options; return { response: 0 } }
+      const contents = BrowserWindow.getAllWindows()[0].webContents
+      const printToPDF = contents.printToPDF.bind(contents)
+      contents.printToPDF = async (options) => {
+        globalThis.__printLayout = await contents.executeJavaScript('({ columns: [...document.querySelectorAll(".cm-pdf-copy table col")].map(col => parseFloat(col.style.width)), diagram: !!document.querySelector(".cm-pdf-copy .cm-md-mermaid svg") })')
+        return printToPDF(options)
+      }
       return true
     })()`)
 
@@ -135,33 +154,34 @@ async function main() {
       await sleep(250)
     }
 
-    await evaluate(main, `(() => {
-      const { BrowserWindow } = require('electron')
-      BrowserWindow.getAllWindows()[0].webContents.send('menu-export-pdf')
-      return true
-    })()`)
-
-    for (let i = 0; i < 480; i++) {
-      if (existsSync(out)) break
-      const failure = await evaluate(main, 'globalThis.__exportError && JSON.stringify(globalThis.__exportError)')
-      if (failure) throw new Error(`导出报错 ${failure}`)
-      await sleep(250)
+    if (!await evaluate(renderer, 'window.electronAPI.exportPDF()') || !existsSync(out)) {
+      throw new Error('PDF 导出没有生成文件')
     }
-    if (!existsSync(out)) throw new Error('120s 内没有产出文件')
+    const { columns, diagram } = await evaluate(main, 'globalThis.__printLayout')
+    if (columns.length !== 4 || columns[0] >= 25 || columns.slice(1).some((width) => width < 20 || width > 35)) {
+      throw new Error(`PDF 的三个对比列宽分配失衡：${columns.map((width) => Math.round(width)).join('% / ')}%`)
+    }
+    if (!diagram) throw new Error('PDF 的打印内容缺少 Mermaid SVG')
+    if (await evaluate(renderer, 'Boolean(document.querySelector(".cm-pdf-copy"))')) {
+      throw new Error('PDF 打印副本未清理')
+    }
+    console.log('✓ PDF 表格按纸面分配列宽，包含 Mermaid 图，导出后已还原界面')
 
     renderer.close()
     main.close()
 
-    const { pages, declared, bytes } = pageCount(out)
-    const count = Math.max(pages, declared)
-    console.log(`PDF ${bytes} 字节，页数 ${count}（/Type /Page ${pages}，/Count ${declared}）`)
-    if (count < MIN_PAGES) {
-      console.log(`✗ 只导出 ${count} 页，${ROWS} 行的文档不可能只有这么点：整篇没有渲染出来`)
+    const { pages, bytes, hasOutline } = pageCount(out)
+    console.log(`PDF ${bytes} 字节，页数 ${pages}`)
+    if (pages < MIN_PAGES) {
+      console.log(`✗ 只导出 ${pages} 页，${ROWS} 行的文档不可能只有这么点：整篇没有渲染出来`)
       process.exitCode = 1
       return
     }
-    console.log(`✓ ${ROWS} 行的文档导出成 ${count} 页，整篇都在纸上`)
+    console.log(`✓ ${ROWS} 行的文档导出成 ${pages} 页，整篇都在纸上`)
+    if (!hasOutline) throw new Error('导出的 PDF 缺少原生书签')
+    console.log('✓ 导出的 PDF 包含原生书签')
   } finally {
+    if (child.exitCode === null) child.kill()
     stopVerifyApp(udd)
     await sleep(300)
   }

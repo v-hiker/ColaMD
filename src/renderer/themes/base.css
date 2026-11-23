@@ -173,6 +173,42 @@ body.platform-win #titlebar {
   background: var(--shell-line);
 }
 
+#export-progress {
+  position: fixed;
+  inset: calc(var(--chrome-row-height) - 2px) 0 auto;
+  z-index: 31;
+  height: 2px;
+  overflow: hidden;
+  pointer-events: none;
+  background: var(--shell-line);
+}
+
+#export-progress:not([hidden])::before {
+  content: '';
+  display: block;
+  width: 30%;
+  height: 100%;
+  background: var(--text-muted);
+  animation: export-progress-sweep 1.2s ease-in-out infinite;
+}
+
+@keyframes export-progress-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(334%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #export-progress:not([hidden])::before {
+    width: 100%;
+    animation: none;
+  }
+}
+
+body.presenting #export-progress {
+  top: 0;
+  z-index: 51;
+}
+
 /* The panel's column is a column below the row, and only below it: the row keeps
    its own surface across the full width. Carrying the seam up through the row
    (2.4.0) put a vertical line in the chrome at the row's right end, which read as

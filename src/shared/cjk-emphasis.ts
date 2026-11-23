@@ -12,8 +12,8 @@ const CLOSING_PUNCTUATION = new Set(PAIRS.values())
 const isBoundary = (char: string) => char === '' || /\s/u.test(char) || PUNCTUATION.test(char)
 
 /** Allow simple asterisk spans next to CJK brackets and quotation marks. */
-export const cjkEmphasis: MarkdownConfig = {
-  parseInline: [{
+export function createCjkEmphasis(onBoundary?: (position: number) => void): MarkdownConfig {
+  return { parseInline: [{
     name: 'CJKEmphasis',
     before: 'Emphasis',
     parse(cx, next, start) {
@@ -42,11 +42,15 @@ export const cjkEmphasis: MarkdownConfig = {
 
       // Let the standard parser handle ambiguous boundaries in escapes, code and links.
       if (/[\r\n\\`<>\[\]]/u.test(content)) return -1
+      if (cjkOpening) onBoundary?.(start)
+      if (cjkClosing) onBoundary?.(end)
       return cx.addElement(cx.elt(size === 2 ? 'StrongEmphasis' : 'Emphasis', start, end, [
         cx.elt('EmphasisMark', start, contentFrom),
         ...cx.parser.parseInline(content, contentFrom),
         cx.elt('EmphasisMark', contentTo, end),
       ]))
     },
-  }],
+  }] }
 }
+
+export const cjkEmphasis = createCjkEmphasis()

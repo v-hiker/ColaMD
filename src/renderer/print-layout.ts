@@ -16,6 +16,7 @@
 // 导出退回原来的行为（宁可少渲染，不要崩）。
 
 import { getEditorScroller, getEditorView } from './editor/editor'
+import { fitPdfTable, measurePdfTables, needsLandscape } from './pdf-table-layout'
 
 const STYLE_ID = 'colamd-paper-layout'
 /** 纸上的标记类。与 `exporting` 分开：那个管「藏起光标与属性区」，这个管「摊平」。 */
@@ -25,13 +26,35 @@ const RENDER_TIMEOUT_MS = 5000
 
 let styleEl: HTMLStyleElement | null = null
 let savedScrollTop = 0
+let pdfCopy: HTMLElement | null = null
+
+export interface PdfPageWidths {
+  portrait: number
+  landscape: number
+}
 
 // 选择器带上 `body.paper`：CodeMirror 的 baseTheme 是运行时注入到 <head> 末尾的，
 // 同为单类时它永远排在后面；加高优先级才盖得住。
 const PAPER_RULES = `
 body.${PAPER_CLASS} #editor { height: auto !important; overflow: visible !important; }
+body.${PAPER_CLASS} #editor.hidden { display: block !important; }
+body.${PAPER_CLASS} #source-editor { display: none !important; }
 body.${PAPER_CLASS} #editor .cm-editor { height: auto !important; }
 body.${PAPER_CLASS} #editor .cm-scroller { display: block !important; height: auto !important; overflow: visible !important; }
+body.${PAPER_CLASS} #editor .cm-pdf-copy { display: none; }
+body.${PAPER_CLASS} #editor .cm-pdf-copy.cm-pdf-measuring {
+  display: block;
+  position: absolute;
+  visibility: hidden;
+}
+#editor .cm-pdf-copy .cm-md-table-widget th { min-width: 0 !important; }
+#editor .cm-pdf-copy .cm-md-table-widget :is(th, td) { overflow-wrap: anywhere; word-break: break-word; }
+@media print {
+  body.${PAPER_CLASS} .cm-scroller:has(> .cm-pdf-copy) > .cm-content:not(.cm-pdf-copy) { display: none; }
+  body.${PAPER_CLASS} #editor .cm-pdf-copy { display: block; width: 100%; }
+  .cm-pdf-copy .pele-zoom { display: none !important; }
+  .cm-pdf-heading-group { display: contents; }
+}
 `
 
 /** CodeMirror 内部那个「视口不受限」的开关。 */
@@ -108,9 +131,67 @@ export async function enterPaperLayout(): Promise<boolean> {
   return true
 }
 
+// Prepare a print-only copy for measuring columns and grouping Setext headings.
+// The page widths come from the main process in millimetres, after margins.
+export async function preparePdfDocument(pageWidths: PdfPageWidths): Promise<boolean> {
+  const view = getEditorView()
+  if (!view || pdfCopy) return false
+  if (!view.contentDOM.querySelector('.cm-md-table-widget, [data-setext-heading][role="heading"]')) return false
+
+  // Diagrams just brought into the rendered range finish asynchronously. Wait
+  // before cloning so the printed copy contains their SVGs.
+  const pendingDiagram = '.cm-md-mermaid:not(.cm-md-mermaid-ready, .cm-md-mermaid-failed)'
+  const deadline = Date.now() + RENDER_TIMEOUT_MS
+  while (view.contentDOM.querySelector(pendingDiagram) && Date.now() < deadline) await nextFrame()
+
+  const copy = view.contentDOM.cloneNode(true) as HTMLElement
+  copy.classList.add('cm-pdf-copy', 'cm-pdf-measuring')
+  copy.removeAttribute('contenteditable')
+  groupMultilinePdfHeadings(copy)
+  copy.style.width = `${pageWidths.portrait}mm`
+  view.scrollDOM.append(copy)
+  pdfCopy = copy
+  try {
+    const tables = measurePdfTables(copy)
+    const landscape = needsLandscape(tables)
+    if (landscape) copy.style.width = `${pageWidths.landscape}mm`
+    for (const table of tables) fitPdfTable(table)
+    return landscape
+  } finally {
+    copy.style.removeProperty('width')
+    copy.classList.remove('cm-pdf-measuring')
+  }
+}
+
+// Several CodeMirror lines can form one Setext heading and one PDF bookmark.
+function groupMultilinePdfHeadings(copy: HTMLElement): void {
+  const headingSelector = '[data-setext-heading][role="heading"]'
+  const continues = (line: Element) => line.nextElementSibling?.getAttribute('data-setext-heading') === line.getAttribute('data-setext-heading')
+  for (const first of copy.querySelectorAll(headingSelector)) {
+    if (!continues(first)) continue
+    const group = document.createElement('div')
+    group.className = 'cm-pdf-heading-group'
+    group.setAttribute('role', 'heading')
+    group.setAttribute('aria-level', first.getAttribute('aria-level') ?? '2')
+    first.removeAttribute('role')
+    first.removeAttribute('aria-level')
+    first.removeAttribute('aria-label')
+    first.before(group)
+    const heading = first.getAttribute('data-setext-heading')
+    let line: Element | null = first
+    while (line && line.getAttribute('data-setext-heading') === heading) {
+      const next: Element | null = line.nextElementSibling
+      group.append(line)
+      line = next
+    }
+  }
+}
+
 /** 收起纸，回到屏幕布局与原来的滚动位置。 */
 export function exitPaperLayout(): void {
   restoreViewport()
+  pdfCopy?.remove()
+  pdfCopy = null
   if (!styleEl) return
   styleEl.remove()
   styleEl = null

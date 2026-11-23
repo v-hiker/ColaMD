@@ -581,13 +581,20 @@ try {
       content.querySelector('code')?.textContent === '字段' &&
       v.state.doc.toString() === ${JSON.stringify(cellEdited)}
   })()`))
-  await evaluate(`(${cellDraft}).dispatch({ selection: { anchor: 4 } })`)
-  check('只展开当前编辑的格式，格内其余标记继续渲染', await evaluate(`(() => {
+  check('光标移入格式片段时，单元格和正文一样保持渲染', await evaluate(`(() => {
     const content = document.activeElement
-    return content.textContent.includes('**新的说明**') &&
-      content.querySelector('.cm-md-link')?.textContent === '链接' &&
-      content.querySelector('code')?.textContent === '字段' &&
-      !content.textContent.includes('https://example.com')
+    const draft = ${cellDraft}
+    const text = draft.state.doc.toString()
+    const positions = ['新的说明', '链接', 'x_1', '字段'].map(label => text.indexOf(label) + 1)
+    return positions.every(anchor => {
+      draft.dispatch({ selection: { anchor } })
+      return draft.state.selection.main.head === anchor &&
+        content.querySelector('strong')?.textContent === '新的说明' &&
+        content.querySelector('.cm-md-link')?.textContent === '链接' &&
+        !!content.querySelector('.cm-md-math .katex') &&
+        content.querySelector('code')?.textContent === '字段' &&
+        !content.textContent.includes('https://example.com')
+    })
   })()`))
   await pressEditorKey('Enter', 13)
   const formattedCell = cellEdited.replace('单元格乙', editedMarkup)
@@ -764,6 +771,45 @@ try {
     cjkRendering.code.includes('注明*“代码”*') && cjkRendering.text.includes('word*"literal"*word') &&
     cjkRendering.text.includes('*“已转义”*'), cjkRendering)
   check('中文强调预览保留源码及磁盘字节', await evaluate('v.state.doc.toString()') === cjkText && readFileSync(cjkFile, 'utf8') === cjkText)
+
+  const fence = '\x60\x60\x60'
+  const languageText = ['# 代码块语言', '', fence + 'text', '正文中的代码', fence, '', '结束', '', ''].join('\n')
+  const languageFile = join(runtime, 'code-language.md')
+  writeFileSync(languageFile, languageText)
+  await openFixture(languageFile, languageText)
+  if (await evaluate('v.state.readOnly')) await readingToggle()
+  check('代码块缩起语言时保持块样式和复制入口', await evaluate(`
+    v.contentDOM.querySelector('.cm-md-codeblock-first .code-copy-btn') &&
+    !v.contentDOM.querySelector('.cm-md-codeinfo, .code-language-btn')
+  `))
+  await evaluate(`v.focus(); v.dispatch({ selection: { anchor: ${languageText.indexOf('正文中的代码') + 2} } })`)
+  const badgePoint = await evaluate(`(() => {
+    const button = v.contentDOM.querySelector('.code-language-btn')
+    const rect = button?.getBoundingClientRect()
+    return rect ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, name: button.textContent } : null
+  })()`)
+  check('光标进入代码块时显示语言入口', badgePoint?.name === 'text', badgePoint)
+  if (badgePoint) {
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await send('Input.dispatchMouseEvent', { type, x: badgePoint.x, y: badgePoint.y, button: 'left', clickCount: 1 })
+    }
+    check('点击语言入口选中围栏上的语言名', await evaluate(`
+      v.state.sliceDoc(v.state.selection.main.from, v.state.selection.main.to) === 'text' &&
+      v.contentDOM.querySelector('.cm-md-codeinfo')?.textContent === 'text'
+    `))
+  }
+  await evaluate(`v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus()`)
+  await send('Input.insertText', { text: fence })
+  await send('Input.insertText', { text: 'js' })
+  check('新建代码块可以在三个反引号后继续输入语言', await evaluate(`
+    v.state.doc.toString().endsWith(${JSON.stringify(fence + 'js')}) &&
+    v.contentDOM.querySelector('.cm-md-codeinfo')?.textContent === 'js'
+  `))
+  await readingToggle()
+  check('阅读模式收起语言入口与围栏行源码', await evaluate(`
+    v.state.readOnly && !v.contentDOM.querySelector('.cm-md-codeinfo, .code-language-btn')
+  `))
+  await readingToggle()
 
   // 源码位置按真实排版测量，代价随光标前的文字线性增长。用接近整篇源码阈值
   // （512K 字符）的文档记录切换耗时，防止退化成多次全文排版。

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, shell, session, clipboard, screen, nativeTheme } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, Menu, shell, session, clipboard, ClipboardItem, screen, nativeTheme } from 'electron'
 import { execFile } from 'child_process'
 import { autoUpdater } from 'electron-updater'
 import { join, basename, dirname, extname, isAbsolute, resolve, relative, sep } from 'path'
@@ -1210,13 +1210,15 @@ ipcMain.handle('save-file-as', async (event, content: string, expectedPath?: str
 
 ipcMain.handle('export-docx', async (event, payload: unknown) => {
   const win = getWinFromEvent(event)
-  const content = typeof payload === 'object' && payload !== null ? (payload as { content?: unknown }).content : payload
-  const images = typeof payload === 'object' && payload !== null ? (payload as { images?: unknown }).images : undefined
+  const fields = payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined
+  const content = fields ? fields.content : payload
   if (!win || typeof content !== 'string') return false
+  const sourcePath = fields?.sourcePath === null || typeof fields?.sourcePath === 'string' ? fields.sourcePath : getState(win).filePath
   win.show()
   win.focus()
-  const diagramImages = images && typeof images === 'object' && !Array.isArray(images)
-    ? Object.fromEntries(Object.entries(images as Record<string, unknown>).filter(([, value]) => typeof value === 'string') as Array<[string, string]>)
+  const diagrams = fields?.diagrams && typeof fields.diagrams === 'object' && !Array.isArray(fields.diagrams)
+    ? Object.fromEntries(Object.entries(fields.diagrams).filter((entry): entry is [string, string] =>
+        typeof entry[1] === 'string' && entry[1].startsWith('data:image/png;base64,')))
     : undefined
   const baseName = suggestFileName(win, content) ?? 'untitled'
   const result = await dialog.showSaveDialog(win, {
@@ -1229,7 +1231,11 @@ ipcMain.handle('export-docx', async (event, payload: unknown) => {
   if (result.canceled || !result.filePath) return false
   try {
     const { markdownToDocx } = await import('./docx-export')
-    await writeFile(result.filePath, await markdownToDocx({ content, sourcePath: getState(win).filePath, images: diagramImages }))
+    const { resolveWordFonts } = await import('./word-fonts')
+    const theme = fields?.theme
+    const stack = theme && typeof theme === 'object' ? (theme as { fontStack?: unknown }).fontStack : undefined
+    const fonts = await resolveWordFonts(win.webContents, stack)
+    await writeFile(result.filePath, await markdownToDocx({ content, sourcePath, diagrams, theme, fonts }))
     shell.showItemInFolder(result.filePath)
     return true
   } catch (error) {
@@ -1244,33 +1250,49 @@ ipcMain.handle('export-docx', async (event, payload: unknown) => {
   }
 })
 
-ipcMain.handle('export-image', async (event, snapshot: unknown, preset: unknown) => {
+ipcMain.handle('export-image', async (event, snapshot: unknown, preset: unknown, destination: unknown = 'file') => {
   const win = getWinFromEvent(event)
   if (!win || (preset !== 'desktop' && preset !== 'mobile') || !snapshot || typeof snapshot !== 'object') return false
+  if (destination !== 'file' && destination !== 'clipboard') return false
   win.show()
   win.focus()
   const { html, styles, bodyClass, background } = snapshot as { html?: unknown; styles?: unknown; bodyClass?: unknown; background?: unknown }
   if (typeof html !== 'string' || typeof styles !== 'string' || typeof bodyClass !== 'string' || typeof background !== 'string') return false
-  const baseName = suggestFileName(win) ?? 'untitled'
-  const suffix = preset === 'desktop' ? 'desktop' : 'mobile'
-  const result = await dialog.showSaveDialog(win, {
-    title: uiText('导出 PNG 图片', 'Export PNG images'),
-    buttonLabel: uiText('导出', 'Export'),
-    nameFieldLabel: uiText('文件名：', 'File name:'),
-    defaultPath: suggestSavePath(win, `${baseName}-${suffix}.png`),
-    filters: [{ name: 'PNG Image', extensions: ['png'] }]
-  })
-  if (result.canceled || !result.filePath) return false
+  let filePath: string | undefined
+  if (destination === 'file') {
+    const baseName = suggestFileName(win) ?? 'untitled'
+    const result = await dialog.showSaveDialog(win, {
+      title: uiText('导出 PNG 图片', 'Export PNG images'),
+      buttonLabel: uiText('导出', 'Export'),
+      nameFieldLabel: uiText('文件名：', 'File name:'),
+      defaultPath: suggestSavePath(win, `${baseName}-${preset}.png`),
+      filters: [{ name: 'PNG Image', extensions: ['png'] }]
+    })
+    if (result.canceled || !result.filePath) return false
+    filePath = result.filePath
+  }
   try {
     const { renderDocumentImages } = await import('./image-export')
-    const pages = await renderDocumentImages({ html, styles, bodyClass, background }, preset)
+    const pages = await renderDocumentImages({ html, styles, bodyClass, background }, preset, { singleImageOnly: !filePath })
+    if (!filePath) {
+      const [page] = pages
+      if (!page) {
+        throw new Error(uiText(
+          '当前文档需要分成多张图。请用「导出图片」保存完整内容。',
+          'This document needs multiple images. Use Export Image to save all pages.'
+        ))
+      }
+      const image = new Blob([new Uint8Array(page)], { type: 'image/png' })
+      await clipboard.write([new ClipboardItem({ 'image/png': image })])
+      return true
+    }
     if (pages.length === 0) throw new Error('没有可导出的内容')
 
-    const extension = extname(result.filePath)
-    const basePath = extension ? result.filePath.slice(0, -extension.length) : result.filePath
+    const extension = extname(filePath)
+    const basePath = extension ? filePath.slice(0, -extension.length) : filePath
     const digits = String(pages.length).length
     const outputPaths = pages.map((_, index) => index === 0
-      ? result.filePath
+      ? filePath
       : `${basePath}-${String(index + 1).padStart(digits, '0')}${extension}`)
     const conflicts = outputPaths.slice(1).filter((path) => existsSync(path))
     if (conflicts.length > 0) {
@@ -1293,7 +1315,9 @@ ipcMain.handle('export-image', async (event, snapshot: unknown, preset: unknown)
     await dialog.showMessageBox(win, {
       type: 'error',
       buttons: [uiText('好', 'OK')],
-      message: uiText('无法导出图片', 'Could not export the images'),
+      message: destination === 'clipboard'
+        ? uiText('无法复制图片', 'Could not copy the image')
+        : uiText('无法导出图片', 'Could not export the images'),
       detail: error instanceof Error ? error.message : String(error),
     })
     return false
@@ -1316,13 +1340,15 @@ ipcMain.handle('export-pdf', async (event) => {
     const background = await win.webContents.executeJavaScript('getComputedStyle(document.body).backgroundColor') as string
     // 打印的是这个窗口本身，所以先把编辑器的痕迹收起来：光标、选区、以及当前行
     // 因为「正在编辑」而显形的源码都不该上纸。
-    await win.webContents.executeJavaScript('window.__colamdPrintExport?.enter()').catch(() => {})
+    const sideMargin = 18
+    const pageWidths = { portrait: 210 - 2 * sideMargin, landscape: 297 - 2 * sideMargin }
+    const landscape = await win.webContents.executeJavaScript(`window.__colamdPrintExport?.enter(${JSON.stringify(pageWidths)})`) === true
     const cssKey = await win.webContents.insertCSS(
       `@media print {
         /* The margins are the page's, so they repeat, and the page carries the
            theme background: without it the margin area stays paper white and a
            warm or dark theme ends up with a bright frame around every page. */
-        @page { margin: 20mm 18mm; background: ${background}; }
+        @page { size: A4 ${landscape ? 'landscape' : 'portrait'}; margin: 20mm ${sideMargin}mm; background: ${background}; }
         html, body, #editor { height: auto !important; overflow: visible !important; background: ${background} !important; }
         #editor { margin: 0 !important; padding: 0 !important; }
         /* 光标与选区是编辑器的东西，不是文档的内容。 */
@@ -1339,6 +1365,9 @@ ipcMain.handle('export-pdf', async (event) => {
       const pdfData = await win.webContents.printToPDF({
         margins: { top: 0, bottom: 0, left: 0, right: 0 },
         printBackground: true,
+        generateTaggedPDF: true,
+        generateDocumentOutline: true,
+        preferCSSPageSize: true,
         pageSize: 'A4'
       })
       await writeFile(result.filePath, pdfData)
@@ -1359,8 +1388,9 @@ ipcMain.handle('export-pdf', async (event) => {
 // the file and the dialog. The renderer is asked to become paper only once the
 // destination is chosen: a document laid out as sheets behind a save dialog
 // reads as the app having come apart.
-async function exportSlidesPDF(win: BrowserWindow | null): Promise<boolean> {
-  if (!win || win.isDestroyed()) return false
+ipcMain.handle('export-slides-pdf', async (event) => {
+  const win = getWinFromEvent(event)
+  if (!win) return false
   const base = suggestFileName(win)
   const result = await dialog.showSaveDialog(win, {
     title: uiText('导出幻灯片 PDF', 'Export Slides PDF'),
@@ -1394,7 +1424,7 @@ async function exportSlidesPDF(win: BrowserWindow | null): Promise<boolean> {
     await win.webContents.executeJavaScript('window.__colamdPrintExport?.exit()').catch(() => {})
     await win.webContents.executeJavaScript('window.__colamdSlidesExport?.exit()').catch(() => {})
   }
-}
+})
 
 // 导出 HTML 与图片走的是另一条路：渲染进程把当前文档的快照（内容 + 样式）交给主进程，
 // 主进程在隐藏窗口里重新排版，不碰用户眼前的这个窗口。
@@ -1837,6 +1867,7 @@ function buildMenu(): void {
         newTab: '新建标签页', closeTab: '关闭标签页',
         recentOpen: '最近打开', restoreOnLaunch: '启动时打开上次文档', clearRecent: '清除最近记录', noRecent: '没有最近打开的文件',
         exportPDF: '导出 PDF...', exportSlidesPDF: '导出幻灯片 PDF...', exportHTML: '导出 HTML...', exportWord: '导出 Word...', exportImageDesktop: '导出图片（电脑阅读）...', exportImageMobile: '导出图片（手机阅读）...', find: '查找',
+        copyImage: '复制图片到剪贴板', imageDesktop: '电脑阅读', imageMobile: '手机阅读',
         setDefault: '设置为默认应用...',
         filePanel: '显示 / 隐藏文件列表', sourceMode: '切换 Markdown 源码', readingMode: '阅读模式（只读）',
         panelSide: '文件列表位置', panelSideLeft: '在左侧', panelSideRight: '在右侧',
@@ -1859,6 +1890,7 @@ function buildMenu(): void {
         newTab: 'New Tab', closeTab: 'Close Tab',
         recentOpen: 'Open Recent', restoreOnLaunch: 'Reopen last document at launch', clearRecent: 'Clear Recent', noRecent: 'No recent files',
         exportPDF: 'Export PDF...', exportSlidesPDF: 'Export Slides PDF...', exportHTML: 'Export HTML...', exportWord: 'Export Word...', exportImageDesktop: 'Export Image (Desktop)...', exportImageMobile: 'Export Image (Mobile)...', find: 'Find',
+        copyImage: 'Copy Image to Clipboard', imageDesktop: 'Desktop', imageMobile: 'Mobile',
         setDefault: 'Set as Default...',
         filePanel: 'Show / Hide File List', sourceMode: 'Toggle Markdown Source', readingMode: 'Reading Mode (read-only)',
         panelSide: 'File List Position', panelSideLeft: 'On the Left', panelSideRight: 'On the Right',
@@ -1991,9 +2023,7 @@ function buildMenu(): void {
           // The same pages the deck shows, one per sheet: a deck that leaves the
           // app with you.
           label: labels.exportSlidesPDF,
-          click: () => {
-            void exportSlidesPDF(getFocusedWindow() ?? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed()) ?? null)
-          }
+          click: () => sendToFocused('menu-export-slides-pdf')
         },
         {
           label: labels.exportHTML,
@@ -2010,6 +2040,13 @@ function buildMenu(): void {
         {
           label: labels.exportImageMobile,
           click: () => sendToFocused('menu-export-image', 'mobile')
+        },
+        {
+          label: labels.copyImage,
+          submenu: [
+            { label: labels.imageDesktop, click: () => sendToFocused('menu-export-image', 'desktop', 'clipboard') },
+            { label: labels.imageMobile, click: () => sendToFocused('menu-export-image', 'mobile', 'clipboard') },
+          ]
         },
         { type: 'separator' },
         {
