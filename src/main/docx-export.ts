@@ -359,6 +359,10 @@ function tableForNode(node: MarkdownNode, context: ExportContext): Table | null 
   })
 }
 
+function containsTable(node: MarkdownNode): boolean {
+  return node.type === 'table' || Boolean(node.children?.some(containsTable))
+}
+
 function blockNodes(nodes: MarkdownNode[] | undefined, context: ExportContext, listDepth = 0): Array<Paragraph | Table> {
   const output: Array<Paragraph | Table> = []
   const { theme } = context
@@ -383,6 +387,13 @@ function blockNodes(nodes: MarkdownNode[] | undefined, context: ExportContext, l
     } else if (node.type === 'image') {
       output.push(...imageBlock(node, context))
     } else if (node.type === 'blockquote') {
+      if (node.children?.some(containsTable)) {
+        for (const child of node.children) {
+          if (containsTable(child)) output.push(...blockNodes([child], context, listDepth))
+          else output.push(...blockNodes([{ ...node, children: [child] }], context, listDepth))
+        }
+        continue
+      }
       const quoteRuns: ParagraphChild[] = []
       for (const child of (node.children ?? []).filter((c) => c.type !== 'blockquote')) {
         if (quoteRuns.length > 0) quoteRuns.push(new TextRun({ break: 1 }))
@@ -411,8 +422,8 @@ function blockNodes(nodes: MarkdownNode[] | undefined, context: ExportContext, l
     } else if (node.type === 'list') {
       const start = node.start ?? 1
       for (const [index, item] of (node.children ?? []).entries()) {
-        const first = item.children?.find((child) => child.type === 'paragraph')
-        const prefix = node.ordered ? (start + index) + '. ' : '• '
+        const first = item.children?.[0]?.type === 'paragraph' ? item.children[0] : undefined
+        const prefix = node.ordered ? `${start + index}. ` : '• '
         output.push(bodyParagraph({
           children: [new TextRun({ text: prefix }), ...inlineRuns(first?.children, context)],
           indent: { left: 360 + listDepth * 360, hanging: 240 },

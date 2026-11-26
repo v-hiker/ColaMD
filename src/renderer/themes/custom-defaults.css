@@ -17,79 +17,38 @@
 
 /* ---- 表格：外框 + 竖线 + 表头 ---- */
 
-/* 原样式给整块表格染了 45% 的表头色，又换成等宽字体缩到 0.875em，
- * 一张表读起来像嵌进文档里的一块灰盒子。 */
-#editor .cm-content .cm-md-table {
-  background: transparent;
-  font-family: inherit;
-  font-size: 1em;
-}
-
-#editor .cm-content .cm-md-table-scroll {
-  container-type: inline-size;
-  padding: 0.2em 0 0.7em;
-}
-
 #editor .cm-content .cm-md-table-widget {
   width: 100%;
-  border-collapse: collapse;
-  table-layout: auto;
 }
 
-#editor .cm-content .cm-md-table-widget th,
-#editor .cm-content .cm-md-table-widget td {
-  border: 1px solid var(--border-color);
+#editor .cm-content .cm-md-table-cell {
   padding: 7px 11px;
   vertical-align: top;
   line-height: 1.65;
 }
 
-#editor .cm-content .cm-md-table-widget th {
-  background: color-mix(in srgb, var(--text-color) 4%, var(--bg-color));
+#editor .cm-content .cm-md-table-header {
+  --table-header-bg: color-mix(in srgb, var(--text-color) 4%, var(--bg-color));
+}
+
+#editor .cm-content .cm-md-table-header .cm-md-table-cell {
   font-weight: 600;
-  min-width: var(--cm-md-column-min-width, 0);
   border-bottom-color: color-mix(in srgb, var(--text-color) 22%, var(--border-color));
 }
 
 /* 多列表格在窄正文栏优先保住表头和参数名，靠表格自己的容器横向滚动。 */
 @container (max-width: 640px) {
-  body:not(.exporting, .paper, .slides-printing, .presenting) #editor .cm-content .cm-md-table-widget:has(thead th:nth-child(4)) th {
-    min-width: max(6em, var(--cm-md-column-min-width, 0px));
+  body:not(.exporting, .paper, .slides-printing, .presenting) #editor .cm-content .cm-md-table-row:has(> [data-column="3"]) > .cm-md-table-cell {
+    min-width: 6em;
   }
 
-  body:not(.exporting, .paper, .slides-printing, .presenting) #editor .cm-content .cm-md-table-widget:has(thead th:nth-child(4)) td > code:only-child {
+  body:not(.exporting, .paper, .slides-printing, .presenting) #editor .cm-content .cm-md-table-row:has(> [data-column="3"]) .cm-md-inlinecode {
     white-space: nowrap;
   }
 }
 
-/* 表格内的大图按比例缩小，避免原图尺寸撑开列宽和行高。 */
-#editor .cm-content .cm-md-table-widget :is(th, td) img {
-  max-width: min(100%, 280px);
-  max-height: 180px;
-  width: auto;
-  height: auto;
-  vertical-align: middle;
-}
-
-#editor .cm-content .cm-md-table-image {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  max-width: min(100%, 280px);
-  margin: 0;
-  vertical-align: middle;
-}
-
-#editor .cm-content .cm-md-table-image .cm-md-image-caption {
-  overflow-wrap: anywhere;
-}
-
-#editor .cm-content .cm-md-table-widget.cm-md-table-measuring :is(th, td) {
-  white-space: nowrap;
-}
-
 /* 格子里的行内代码跟着表格字号走，别在 1em 的表里缩成正文那个 0.875em。 */
-#editor .cm-content .cm-md-table-widget code {
+#editor .cm-content .cm-md-table-cell .cm-md-inlinecode {
   font-size: 0.94em;
   padding: 0.1em 0.3em;
   border-radius: 3px;
@@ -140,6 +99,21 @@
   align-self: stretch;
   contain: inline-size;
   overflow-wrap: anywhere;
+}
+
+/* 单元格只展示缩略图，图注随图片宽度换行。 */
+#editor .cm-content .cm-md-table-cell .cm-md-image {
+  display: flex;
+  max-width: min(100%, 280px);
+  margin: 0 auto;
+}
+
+#editor .cm-content .cm-md-table-cell img:not(.cm-widgetBuffer) {
+  max-width: min(100%, 280px);
+  max-height: 180px;
+  width: auto;
+  height: auto;
+  vertical-align: middle;
 }
 
 /* ---- Wide 档跟随窗口 ---- */

@@ -9,12 +9,16 @@
 // 这一层需要 DOM（EditorView 要做布局测量）。不依赖 DOM 的那一半在 state.ts 里，
 // 验收脚本直接消费那一半，所以保真的证明不需要真实浏览器。
 
-import { EditorState, RangeSet, type Extension } from '@codemirror/state'
+import { tableEditing } from './table-editing'
+import { Compartment, EditorState, RangeSet, type Extension } from '@codemirror/state'
 import { EditorView, drawSelection, dropCursor, highlightSpecialChars, rectangularSelection, crosshairCursor, Decoration } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import { undo, redo } from '@codemirror/commands'
+import { paragraphLayout } from './paragraph-layout'
 import { livePreview, setEditorFocus, setMeasureHost, readingModeField } from './live-preview'
 import { listInput } from './list-input'
+import { QUOTE_PREFIX_RE, frontmatterEnd, isActiveOrderedListLine, parseListLine } from './list-model'
+import { codeBlockSelectAll } from './code-select'
 import { searchHighlightField } from './search-highlight'
 import { stateExtensions, editableCompartment, bodyStart } from './state'
 import { editorTheme } from './source-theme'
@@ -45,6 +49,8 @@ export interface EditorOptions {
   redo(): void
   /** 拿到底层 view（装饰层、搜索面板需要）。 */
   getView(): EditorView
+  /** 主题这类外部样式换过之后，让编辑器按新字体重量行高。 */
+  remeasure(): void
   /** 销毁。 */
   destroy(): void
 }
@@ -56,35 +62,65 @@ export function getEditorHandle(): EditorHandle | null {
 }
 
 /**
- * 任务项的方框（`[ ]` / `[x]`）当作原子区间。
- *
- * 它被换成了一个 checkbox widget，但替换本身不拦光标：不声明的话光标能停在两个方框
- * 之间那一格里，看不见自己在哪，按左右键要一格一格试（#164）。声明成原子区间后，
- * 左右键一次跨过整个复选框。
- *
- * 范围从语法树上取，所以只覆盖眼下已经解析过的那一段；远处的任务项滚过去、被解析
- * 之后才变成原子，而光标本来也去不了没解析的地方，这个精度够用。
+ * 列表前缀与任务复选框的原子区间：
+ *   1. 任务项的 `[ ]` / `[x]` 换成 checkbox widget，声明为原子区间让左右键一次跨过（#164）；
+ *   2. 渲染模式下有序列表项的前缀（前导空格 + `1.` + 空格）同样声明为原子区间，
+ *      避免光标停在 `1` 与 `.` 之间误把 `1.` 敲成 `10.` 触发整表跳号。
  */
-const taskMarkerAtomicRanges = EditorView.atomicRanges.of((view) => {
+const listPrefixAtomicRanges = EditorView.atomicRanges.of((view) => {
   const doc = view.state.doc
+  const tree = syntaxTree(view.state)
+  const fmEnd = frontmatterEnd(doc)
   const ranges: { from: number; to: number }[] = []
-  syntaxTree(view.state).iterate({
-    enter: (node) => {
-      if (node.name !== 'TaskMarker') return
-      const line = doc.lineAt(node.from)
-      // 行的前缀（`- ` / `* ` / `1. `）也算进来：光标停在 `-` 和 `[` 之间打字，
-      // 列表标记就没了；停在 `]` 和正文之间打字，`[x]` 后面不再跟空格，任务语法也拆了。
-      // 两种都是 `TaskMarker` 看着还在、下一帧就变回源码的那种怪事（#164）。
-      const prefix = doc.sliceString(line.from, node.from)
-      const quoteLen = /^(?:[ \t]*> ?)+/.exec(prefix)?.[0].length ?? 0
-      const listPart = prefix.slice(quoteLen)
-      const from = /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+$/.test(listPart) ? line.from + quoteLen : node.from
-      const trailing = doc.sliceString(node.to, Math.min(node.to + 1, line.to)) === ' ' ? node.to + 1 : node.to
-      ranges.push({ from, to: trailing })
-    },
-  })
-  // 这个值不参与绘制，只借 Range 的形状把位置报上去。
-  return RangeSet.of(ranges.map((r) => ATOMIC_MARK.range(r.from, r.to)), true)
+
+  // 1. 有序列表行（只守护真有序项或刚敲完的空 `1. `，不锁普通折行里的 `2026. 敬请期待`）
+  const seenLines = new Set<number>()
+  for (const vp of view.visibleRanges) {
+    const startLine = doc.lineAt(vp.from).number
+    const endLine = doc.lineAt(vp.to).number
+    for (let ln = startLine; ln <= endLine; ln++) {
+      if (seenLines.has(ln)) continue
+      seenLines.add(ln)
+      const parsed = isActiveOrderedListLine(doc, tree, ln, fmEnd)
+      if (!parsed) continue
+      const line = doc.line(ln)
+      const from = line.from + parsed.quoteLen
+      const to = line.from + parsed.contentOffset
+      if (to > from) ranges.push({ from, to })
+    }
+  }
+
+  // 2. 无序任务项复选框（只扫可见视口，避免大文档全树遍历；有序任务项已被上面整段覆盖）
+  for (const vp of view.visibleRanges) {
+    tree.iterate({
+      from: vp.from,
+      to: vp.to,
+      enter: (node) => {
+        if (node.name !== 'TaskMarker') return
+        const line = doc.lineAt(node.from)
+        const parsed = parseListLine(line.text)
+        if (!parsed || parsed.kind === 'ordered') return
+        const prefix = doc.sliceString(line.from, node.from)
+        const quoteLen = QUOTE_PREFIX_RE.exec(prefix)?.[0].length ?? 0
+        const listPart = prefix.slice(quoteLen)
+        const from = /^[ \t]*(?:[-*+]|\d+[.)]) +$/.test(listPart) ? line.from + quoteLen : node.from
+        const trailing = doc.sliceString(node.to, Math.min(node.to + 1, line.to)) === ' ' ? node.to + 1 : node.to
+        if (trailing > from) ranges.push({ from, to: trailing })
+      },
+    })
+  }
+
+  ranges.sort((a, b) => a.from - b.from || a.to - b.to)
+  const merged: { from: number; to: number }[] = []
+  for (const r of ranges) {
+    const last = merged[merged.length - 1]
+    if (last && r.from <= last.to) {
+      if (r.to > last.to) last.to = r.to
+    } else {
+      merged.push({ ...r })
+    }
+  }
+  return RangeSet.of(merged.map((r) => ATOMIC_MARK.range(r.from, r.to)), true)
 })
 
 const ATOMIC_MARK = Decoration.replace({})
@@ -132,6 +168,8 @@ function keepSelectableWhenReadOnly(view: EditorView, readOnly: boolean): void {
 
 export function createEditorCore(parent: HTMLElement, options: EditorOptions = {}): EditorHandle {
   const changeListener = options.onChange
+  const themeLayout = new Compartment()
+  const remeasureTheme = EditorView.theme({})
 
   const extension = [
     // 状态层：语言、高亮、撤销栈、缩进、快捷键（无 DOM，可进 harness）
@@ -146,9 +184,11 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
     rectangularSelection(),
     crosshairCursor(),
     editorTheme,
+    themeLayout.of([]),
     // 装饰层：把源码画成所见即所得。它只画不写，所以装在这里不会影响
     // 「没改过的字节不许变」这条纪律。
     livePreview,
+    paragraphLayout,
     // 焦点变化要重算装饰：只有**正在编辑**的那一行才显示源码（见 live-preview 的 setEditorFocus）。
     // 用 DOM 事件而不是 EditorView.focusChangeEffect，是因为后者在创建时就已带焦点的编辑器上
     // 不会触发；下面创建完 view 之后补了一次初始值。
@@ -179,13 +219,13 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
     }),
     // 回车续列表。这是编辑器的输入手感，与渲染无关，所以单独一个模块。
     listInput,
+    // 代码块里的 ⌘A 先只选这段代码（见 code-select.ts）
+    codeBlockSelectAll,
     // 检索高亮。面板靠 effect 改它，而 effect 得有 StateField 接住；
     // 不装这一条，检索面板会以为高亮画上了，实际什么也没发生。
     searchHighlightField,
-    // 任务项的复选框是一个 replace widget，但没声明成原子区间时，光标能停在
-    // `[ ]` 两个方框之间那一格里：左右键要一格一格挪过去，停在里面打字又把
-    // `- [ ]` 敲成 `- [x]` 之类的残骸（#164）。声明成原子区间后，光标一次跨过它。
-    taskMarkerAtomicRanges,
+    listPrefixAtomicRanges,
+    tableEditing,
     editableCompartment.of(editabilityExtensions(options.editable ?? true)),
     // 文档变化的唯一出口：把新文本交给外壳
     EditorView.updateListener.of((update) => {
@@ -256,6 +296,11 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
     undo: () => { undo(view) },
     redo: () => { redo(view) },
     getView: () => view,
+    remeasure(): void {
+      // 短文档的总高度可能被 min-height 撑住，requestMeasure 不会重测行高。
+      // 公开 API 里只有 theme 变化会让 CM 重量内容：在空主题和无之间切一次，不改文档或撤销栈。
+      view.dispatch({ effects: themeLayout.reconfigure(themeLayout.get(view.state) === remeasureTheme ? [] : remeasureTheme) })
+    },
     destroy(): void {
       contentEditableGuard?.disconnect()
       contentEditableGuard = null

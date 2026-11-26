@@ -10,7 +10,7 @@ export interface SiblingFile {
 type FileOpenedData = { path: string | null; content: string; fileUrl: string | null }
 type ImageExportPreset = 'desktop' | 'mobile'
 export type ImageExportDestination = 'file' | 'clipboard'
-type ImageExportSnapshot = { html: string; styles: string; bodyClass: string; background: string }
+type ImageExportSnapshot = { tableLayout?: string; html: string; styles: string; bodyClass: string; background: string }
 export type FileManagerName = 'finder' | 'explorer' | 'file-manager'
 
 const pendingFileOpened: FileOpenedData[] = []
@@ -32,6 +32,9 @@ export interface ElectronAPI {
   getFileManagerName: () => Promise<FileManagerName>
   revealFile: () => Promise<boolean>
   showEntryContextMenu: (path: string, kind: 'file' | 'directory') => Promise<void>
+  renameFile: (path: string, name: string) => Promise<{ path?: string; error?: string }>
+  onRequestRenameFile: (callback: (path: string) => void) => void
+  onFileRenamed: (callback: (data: { oldPath: string; newPath: string; fileUrl: string }) => void) => void
   showTabContextMenu: (payload: { tabId: string; filePath: string | null; canCloseOthers: boolean; canCloseRight: boolean }) => Promise<void>
   showEditorContextMenu: (payload: { selection: string; link: string | null; image: string | null; canSelectAll: boolean }) => Promise<void>
   onEditorMenuAction: (callback: (action: string, value: string | null) => void) => void
@@ -121,6 +124,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   showEditorContextMenu: (payload: { selection: string; link: string | null; image: string | null; canSelectAll: boolean }) => ipcRenderer.invoke('editor-context-menu', payload) as Promise<void>,
   onEditorMenuAction: (callback: (action: string, value: string | null) => void) => {
     ipcRenderer.on('editor-menu-action', (_event, action: string, value: string | null) => callback(action, value))
+  },
+  renameFile: (path: string, name: string) => ipcRenderer.invoke('rename-file', path, name),
+  onRequestRenameFile: (callback: (path: string) => void) => {
+    ipcRenderer.on('request-rename-file', (_event, path: string) => callback(path))
+  },
+  onFileRenamed: (callback: (data: { oldPath: string; newPath: string; fileUrl: string }) => void) => {
+    ipcRenderer.on('file-renamed', (_event, data) => callback(data))
   },
   showTabContextMenu: (payload: { tabId: string; filePath: string | null; canCloseOthers: boolean; canCloseRight: boolean }) => ipcRenderer.invoke('tab-context-menu', payload) as Promise<void>,
   onTabMenuAction: (callback: (payload: { action: string; tabId: string }) => void) => {

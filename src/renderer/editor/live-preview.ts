@@ -17,12 +17,12 @@
 // 原因不是风格问题：CodeMirror 把「函数式提供的装饰」标记为动态，而动态装饰
 // **不许跨行替换**，命中就抛 `RangeError: Decorations that replace line breaks may not
 // be specified via plugins`（node_modules/@codemirror/view/dist/index.cjs:2780）。
-// 块公式、属性区、mermaid、表格都是跨行替换，用 compute 提供会让整层装饰更新中途抛错，
+// 块公式、属性区、mermaid 都是跨行替换，用 compute 提供会让整层装饰更新中途抛错，
 // 表现为「整个界面错乱」。StateField + provide 提供的是装饰集本身，不是函数，
 // 跨行替换与块级 widget 才被允许。
 
-import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from '@codemirror/view'
-import { EditorState, RangeSetBuilder, StateEffect, StateField, type Extension, type Range as StateRange } from '@codemirror/state'
+import { Decoration, EditorView, keymap, ViewPlugin, WidgetType, type DecorationSet, type Rect, type ViewUpdate } from '@codemirror/view'
+import { EditorSelection, EditorState, MapMode, Prec, RangeSetBuilder, StateEffect, StateField, type Extension } from '@codemirror/state'
 import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
@@ -30,12 +30,11 @@ import { decodeString } from 'micromark-util-decode-string'
 import { markdownParser } from './state'
 import { documentHeadings } from './heading-anchor'
 import { scanMath, excludedRanges, frontmatterRange, type Excluded, type MathRange } from './math-scan'
+import { inlineMathClickOffset } from './inline-math-click'
+import { QUOTE_PREFIX_RE, parseListLine } from './list-model'
 import { renderMermaid, attachDiagramZoom, detachDiagramZoom, isDiagramZoomed } from './mermaid-bridge'
 import { sanitizeHTML, cleanStyle, isSafeURL } from './html-sanitize'
 import { footnoteDefinitions, footnoteNumbers, FOOTNOTE_REF_RE } from './footnotes'
-import { observeTableLayout, stopObservingTableLayout } from './table-layout'
-import { attachTableRows, displayCellText, readTableSource, type CellSource } from './table-source'
-import { finishRemovedTableEdit } from './table-cell-edit'
 import { openImageOverlay } from './image-overlay'
 import { isChinese } from '../ui-language'
 
@@ -65,6 +64,20 @@ function pushBlockLines(
   }
 }
 /**
+ * 列表首行的复制信息独立添加，与整项的逐行样式合并。
+ *
+ * 有序与否只放在 `data-list-number` 上，不挂 `cm-md-li-ordered`：那个类管缩进，
+ * 有序待办项故意不挂它（见 pushListItemLines），复制却仍要知道它是有序列表。
+ */
+function pushListItemStart(state: EditorState, mark: SyntaxNode, node: SyntaxNode, ranges: DecorationRange[]): void {
+  const number = node.parent?.name === 'OrderedList' ? Number.parseInt(state.doc.sliceString(mark.from, mark.to), 10) : NaN
+  const from = state.doc.lineAt(node.from).from
+  ranges.push({ from, to: from, deco: Decoration.line({
+    class: 'cm-md-li-start',
+    attributes: Number.isFinite(number) ? { 'data-list-number': String(number) } : undefined,
+  }) })
+}
+/**
  * 列表项：只给它**自己那一行**加类，不给它子列表里的行加。
  *
  * 一个 ListItem 的区间包含它下面的子列表，按区间铺类的话，嵌套项那一行会同时拿到
@@ -72,18 +85,21 @@ function pushBlockLines(
  * 里规则的前后顺序才侥幸对。所以每一行都要问一次语法树：包住这一行的**最内层**
  * ListItem 是不是我自己。
  */
-const QUOTE_PREFIX_RE = /^(?:[ \t]*> ?)+/
-
 function hasListSpace(state: EditorState, markTo: number): boolean {
   const ch = markTo < state.doc.length ? state.doc.sliceString(markTo, markTo + 1) : ''
-  return ch === ' ' || ch === '\t'
+  // 只有标记后紧跟普通空格才触发列表格式；按 Tab 产生的 `\t` 不触发列表渲染
+  return ch === ' '
 }
 
 function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: DecorationRange[]): void {
   const selfMark = node.getChild('ListMark')
   // 孤立一个 `-` 或 `1.`（后面还没敲空格）不算成型的列表项，等空格落下再缩进。
   if (!selfMark || !hasListSpace(state, selfMark.to)) return
-  const className = `cm-md-li cm-md-li-${Math.min(listDepth(node), 6)}`
+  pushListItemStart(state, selfMark, node, ranges)
+  const afterMark = state.doc.sliceString(selfMark.to, Math.min(selfMark.to + 4, state.doc.length))
+  // 有序待办项的序号会被 ListMark 隐藏，只留复选框，不挂 cm-md-li-ordered 以免折行偏右
+  const isOrdered = node.parent?.name === 'OrderedList' && !/^ +\[[ xX]\]/.test(afterMark)
+  const baseClass = `cm-md-li cm-md-li-${Math.min(listDepth(node), 6)}`
   const tree = syntaxTree(state)
   // 行没有 li 外壳，续行也没有 ListMark。把语法树里已有的归属带到导出层，
   // 表格、空行与父项续文才不会被误认成另一项；这里只记录位置，不另存内容。
@@ -110,11 +126,13 @@ function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: Decorat
   }
 
   const first = state.doc.lineAt(node.from).number
-  const ownLast = state.doc.lineAt(node.to).number
-  // 同一列表的相邻项目间空行属于分隔，不让导出把一张列表截成两张。
+  const ownLast = state.doc.lineAt(Math.max(node.from, node.to - 1)).number
+  // 同一列表的相邻项目间空行保留 data-list-path 供导出/复制拼接，但不挂 cm-md-li 缩进类，
+  // 避免退出列表或删行后光标停在 1.5em 缩进位置、打字才跳回左边缘。
   const last = node.nextSibling?.name === 'ListItem' ? state.doc.lineAt(node.nextSibling.from).number - 1 : ownLast
   for (let n = first; n <= last; n++) {
     const line = state.doc.line(n)
+    const isBlank = line.text.replace(QUOTE_PREFIX_RE, '').trim() === ''
     if (n > first && n <= ownLast && line.to <= ownEnd) {
       // 用户在空列表项按回车退出列表后直接顶格打字，CommonMark 仍把无缩进的下一行算作懒续行；
       // 没有缩进的非空行已经退出列表，不该继续挂列表缩进和归属。
@@ -134,10 +152,27 @@ function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: Decorat
       if (body.trim() !== '' && !/^[ \t]/.test(body)) break
     }
     const paragraph = paragraphs.find(block => block.from <= line.to && block.to > line.from)
-    ranges.push({ from: line.from, to: line.from, deco: Decoration.line({ class: className, attributes: {
+    const lineAttrs = {
       ...attributes,
       ...(paragraph ? { 'data-list-paragraph': String(paragraph.from) } : {}),
-    } }) })
+    }
+    const lineClass = n > first && isBlank
+      ? `${baseClass} cm-md-li-blank`
+      : (isOrdered
+          ? (n === first ? `${baseClass} cm-md-li-ordered` : `${baseClass} cm-md-li-ordered-cont`)
+          : baseClass)
+    ranges.push({ from: line.from, to: line.from, deco: Decoration.line({ class: lineClass, attributes: lineAttrs }) })
+    // 列表项内的普通缩进续行：CSS 的 cm-md-li-* 已经给了对应层级的左缩进，
+    // 藏掉行首源码里的对齐空格/制表符，避免屏幕上叠出双倍缩进。
+    if (n > first && !isBlank && paragraph) {
+      const quoteLen = QUOTE_PREFIX_RE.exec(line.text)?.[0].length ?? 0
+      const leadLen = /^[ \t]+/.exec(line.text.slice(quoteLen))?.[0].length ?? 0
+      const hideFrom = line.from + quoteLen
+      const atLead = tree.resolveInner(hideFrom, 1).name
+      if (leadLen > 0 && (atLead === 'Paragraph' || atLead === 'ListItem')) {
+        ranges.push({ from: hideFrom, to: hideFrom + leadLen, deco: hide(hideFrom, hideFrom + leadLen) })
+      }
+    }
   }
 }
 
@@ -448,14 +483,14 @@ function isActiveRange(_state: EditorState, _from: number, _to: number): boolean
 }
 
 /**
- * 块级 widget（表格、图、HTML 块、块公式）的判据：光标落进块里就露源码。
+ * 块级 widget（图、HTML 块、块公式）的判据：光标落进块里就露源码。
  *
  * 这些块是把**整段源码**替换成渲染结果的，光标一落进去，打出来的字写进的是被盖住的
- * 源码。所以光标进块时把源码露出来，点走再渲染回去。Obsidian 对表格就是这么做的，
- * 也是 2026-10-15 对 #153 的裁定。
+ * 源码。所以光标进块时把源码露出来，点走再渲染回去（2026-10-15 对 #153 的裁定）。
+ * 表格不在此列：它保留为文字装饰，在单元格里直接改（table-editing.ts）。
  *
  * 行内的标记不在此列（2026-10-06 定）：光标所在的行不再整行露源码，要改标记去源码模式。
- * 两端都算在内：点表格落在源码第一行开头，那是块的起点，也算「在里面」。
+ * 两端都算在内：点图表落在源码第一行开头，那是块的起点，也算「在里面」。
  */
 function isBlockActive(state: EditorState, from: number, to: number): boolean {
   // 阅读模式下一律不认：块级 widget 保持渲染结果，点它也不会退回源码。
@@ -468,9 +503,6 @@ function isBlockActive(state: EditorState, from: number, to: number): boolean {
 
 /**
  * 画一个公式。
- *
- * 两个调用点：正文里的 MathWidget，和表格单元格里的行内公式。表格是整块替换渲染的，
- * 格子里的文字挂不上 CodeMirror 的装饰层，只能在拼 DOM 的时候自己画。
  *
  * 渲染失败时把源码原样放回去（`cm-md-math-error`），宁可难看也不丢字。
  */
@@ -497,7 +529,7 @@ function mathElement(code: string, block: boolean): HTMLElement {
  * 行内公式用 Widget 覆盖原文，而不是把 `$x$` 藏起来再插一段渲染结果：
  * 两者视觉相同，覆盖的写法不必分别处理两个定界符的位置。
  *
- * 光标所在行照旧退回原文，用户可以就地改。渲染失败时显示 `$...$` 源码。
+ * 行内公式只有选区严格落在节点内部才展开；边界和跨节点选区保持原子渲染。
  *
  * widget 上带着源码区间（见 `withSourceRange`）：点它要能就地编辑，
  * 而 DOM 里除了这里没有别的地方知道这段公式在缓冲区里的位置。
@@ -514,6 +546,10 @@ class MathWidget extends WidgetType {
 
   eq(other: MathWidget): boolean {
     return other.code === this.code && other.block === this.block && other.from === this.from && other.to === this.to
+  }
+
+  ignoreEvent(event: Event): boolean {
+    return this.block || event.type !== 'mousedown'
   }
 
   toDOM(): HTMLElement {
@@ -548,30 +584,138 @@ function listDepth(node: SyntaxNode): number {
   return depth
 }
 
-/** 扫描公式并压入装饰。 */
+/** 严格内部：触碰外边界或跨过节点的选区都不展开。 */
+function isInlineMathActive(state: EditorState, from: number, to: number): boolean {
+  if (readingMode(state)) return false
+  return !exportingCleanly(state) && state.selection.ranges.some(sel => sel.from > from && sel.to < to)
+}
+
+/**
+ * 扫描公式并压入装饰。源码区间同时供导航与 atomicRanges 使用。
+ *
+ * 行内公式也登记成活动区：选区只变不改文档时，装饰层靠活动区判断要不要重算，
+ * 不登记的话光标在同一行移进公式不会展开源码。
+ */
 function collectMath(
   state: EditorState,
-  text: string,
-  excluded: Excluded[],
+  math: MathRange[],
   ranges: DecorationRange[],
   zones: ActiveZone[],
 ): void {
-  for (const range of scanMath(text, excluded)) {
-    if (range.block) zones.push({ from: range.from, to: range.to, kind: 'block' })
-    // 块公式：光标落进去就退回源码，就地改（行内公式的判据见上，保持不露）
-    if (isActiveLine(state, range.from) || (range.block && isBlockActive(state, range.from, range.to))) {
-      const delim = range.block ? 2 : 1
+  if (!math.length) return
+  // 外层格式可以恰好只包住公式。它不是公式内部的 Markdown 装饰；边界要包住
+  // 整个替换 widget，也要排在同范围的源码 mark 外面，复制时才能自然继承样式。
+  const inlineEnds = new Map(math.filter(range => !range.block).map(range => [range.from, range.to]))
+  const enclosingMarks = new Set<DecorationRange>()
+  for (const item of ranges) {
+    if (!item.deco.point && inlineEnds.get(item.from) === item.to) {
+      item.deco = MARK({ ...item.deco.spec, inclusive: true })
+      enclosingMarks.add(item)
+    }
+  }
+  for (const range of math) {
+    zones.push({ from: range.from, to: range.to, kind: range.block ? 'block' : 'inline' })
+    const opening = state.doc.sliceString(range.from, range.from + 2)
+    const delim = opening === '$$' || opening[0] === '\\' ? 2 : 1
+    const inlineMath = range.block ? undefined : { delim }
+    if (!exportingCleanly(state) && (range.block ? isBlockActive(state, range.from, range.to)
+        : isInlineMathActive(state, range.from, range.to))) {
+      // 公式源码不能再被 Markdown 的强调、链接等行内装饰遮住。
+      if (!range.block) for (let i = ranges.length - 1; i >= 0; i--) {
+        const item = ranges[i]
+        if (item.from >= range.from && item.to <= range.to && item.from !== item.to &&
+            !enclosingMarks.has(item) && !item.deco.spec.class?.includes('cm-md-table-')) ranges.splice(i, 1)
+      }
+      if (!range.block) ranges.push({ from: range.from, to: range.to, deco: MARK({ class: 'cm-md-math-source', inclusive: true, inlineMath }) })
       ranges.push({ from: range.from, to: range.from + delim, deco: MARK({ class: 'cm-md-marker' }) })
       ranges.push({ from: range.to - delim, to: range.to, deco: MARK({ class: 'cm-md-marker' }) })
-      continue
+    } else {
+      ranges.push({ from: range.from, to: range.to,
+        deco: Decoration.replace({ widget: new MathWidget(range.code, range.block, range.from, range.to), inlineMath }) })
     }
-    ranges.push({
-      from: range.from,
-      to: range.to,
-      deco: Decoration.replace({ widget: new MathWidget(range.code, range.block, range.from, range.to) }),
-    })
+  }
+  if (enclosingMarks.size) {
+    // CM 把同范围、同 startSide 的后一个 mark 放外层。源码 wrapper 必须在格式
+    // 里面，否则清洁复制读取源码 textContent 时会越过被包在里面的颜色/链接。
+    let kept = 0
+    for (const item of ranges) if (!enclosingMarks.has(item)) ranges[kept++] = item
+    ranges.length = kept
+    for (const item of enclosingMarks) ranges.push(item)
   }
 }
+
+/** 只查当前位置附近已计算的装饰，不为每个方向键重新扫描文档。 */
+function enterInlineMath(view: EditorView, direction: -1 | 1): boolean {
+  if (view.composing || !view.state.selection.main.empty || view.state.selection.ranges.length !== 1 || exportingCleanly(view.state)) return false
+  const head = view.state.selection.main.head
+  let anchor: number | undefined
+  view.state.field(livePreviewField).between(head, head, (from, to, value) => {
+    if (!value.spec.inlineMath || !(value.spec.widget instanceof MathWidget)) return
+    if (direction === 1 && from === head) anchor = from + value.spec.inlineMath.delim
+    if (direction === -1 && to === head) anchor = to - value.spec.inlineMath.delim
+  })
+  if (anchor === undefined) return false
+  view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(anchor, direction)]), scrollIntoView: true, userEvent: 'select' })
+  return true
+}
+
+const inlineMathNavigation = [
+  // 在表格、列表自己的导航前处理公式边界，其余按键交还原来的规则。
+  Prec.highest(keymap.of([
+    { key: 'ArrowRight', run: view => enterInlineMath(view, 1) },
+    { key: 'ArrowLeft', run: view => enterInlineMath(view, -1) },
+    { key: 'Delete', run: view => enterInlineMath(view, 1) },
+    { key: 'Backspace', run: view => enterInlineMath(view, -1) },
+  ])),
+  Prec.highest(EditorView.domEventHandlers({
+    mousedown(event, view) {
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || view.composing) return false
+      let widget = (event.target as HTMLElement).closest<HTMLElement>('.cm-md-math-inline[data-source-from]')
+      if (!widget || exportingCleanly(view.state)) return false
+      // 表格空单元格或临时段落输入框若仍在组字，先在旧选区下失焦提交，避免组字内容写入点中的公式位置。
+      const activeInput = view.dom.ownerDocument.activeElement
+      if (activeInput instanceof HTMLElement && activeInput.closest('.cm-md-table-input, .cm-md-table-paragraph-input') && view.contentDOM.contains(activeInput)) {
+        activeInput.blur()
+        if (!widget.isConnected) {
+          widget = view.dom.ownerDocument.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('.cm-md-math-inline[data-source-from]') ?? null
+          if (!widget) return false
+        }
+      }
+      const from = Number(widget.dataset.sourceFrom), to = Number(widget.dataset.sourceTo)
+      const rect = widget.getBoundingClientRect()
+      if (rect.width <= 0 || event.clientX < rect.left || event.clientX > rect.right) return false
+      const delim = view.state.sliceDoc(from, from + 2) === '$$' || view.state.sliceDoc(from, from + 1) === '\\' ? 2 : 1
+      const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
+      let anchor = from + delim + Math.round(ratio * (to - from - 2 * delim))
+      if (!event.shiftKey) {
+        const contentFrom = from + delim
+        const offset = inlineMathClickOffset(widget, event.target as Element, view.state.sliceDoc(contentFrom, to - delim),
+          event.clientX, event.clientY, anchor - contentFrom)
+        if (offset !== undefined) anchor = contentFrom + offset
+      }
+      // 不把 UTF-16 代理对劈开。
+      if (anchor > from + delim && /[\uDC00-\uDFFF]/.test(view.state.sliceDoc(anchor, anchor + 1))) anchor--
+      event.preventDefault()
+      const selection = event.shiftKey
+        ? EditorSelection.single(view.state.selection.main.anchor, ratio < 0.5 ? from : to)
+        : EditorSelection.create([EditorSelection.cursor(anchor)])
+      view.dispatch({ selection, userEvent: 'select.pointer' })
+      view.contentDOM.focus({ preventScroll: true })
+      return true
+    },
+  })),
+]
+
+const inlineMathAtoms = new WeakMap<DecorationSet, DecorationSet>()
+const inlineMathAtomicRanges = EditorView.atomicRanges.of(view => {
+  const decorations = view.state.field(livePreviewField)
+  let atoms = inlineMathAtoms.get(decorations)
+  if (!atoms) {
+    atoms = decorations.update({ filter: (_from, _to, value) => !!value.spec.inlineMath && value.spec.widget instanceof MathWidget })
+    inlineMathAtoms.set(decorations, atoms)
+  }
+  return atoms
+})
 
 // ─── 高亮 `==文字==` ─────────────────────────────────────────────────────────
 //
@@ -581,22 +725,83 @@ function collectMath(
 /** `==高亮==` 的匹配。不吃跨行，也不吃空的 `====`。 */
 const HIGHLIGHT_RE = /(?<![=])==(?!=)([^=\n]+?)==(?!=)/g
 
-function collectHighlight(state: EditorState, text: string, ranges: DecorationRange[], excluded: Excluded[]): void {
-  const inExcluded = (pos: number) => excluded.some((e) => pos >= e.from && pos < e.to)
+function collectTableBounds(tree: ReturnType<typeof syntaxTree>, front: Excluded | null): { tables: Excluded[]; cells: Excluded[] } {
+  const tables: Excluded[] = []
+  const cells: Excluded[] = []
+  tree.iterate({
+    enter: (node) => {
+      if (front && node.from < front.to) return false
+      if (node.name === 'Table') {
+        tables.push({ from: node.from, to: node.to })
+      } else if (node.name === 'TableCell') {
+        cells.push({ from: node.from, to: node.to })
+        return false
+      }
+    },
+  })
+  return { tables, cells }
+}
 
-  HIGHLIGHT_RE.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = HIGHLIGHT_RE.exec(text)) !== null) {
-    const start = match.index
-    const end = start + match[0].length
-    if (inExcluded(start)) continue
-    const active = isActiveLine(state, start)
-    // 藏定界符，给中间那段加底色；光标在这一行时定界符露出来，但仍要能认出来
-    const delimiter = (from: number, to: number) =>
-      active ? MARK({ class: 'cm-md-marker' }) : hide(from, to)
-    ranges.push({ from: start, to: start + 2, deco: delimiter(start, start + 2) })
-    ranges.push({ from: end - 2, to: end, deco: delimiter(end - 2, end) })
-    ranges.push({ from: start + 2, to: end - 2, deco: MARK({ class: 'cm-md-highlight' }) })
+function sliceExcluded(excluded: Excluded[], from: number, to: number): Excluded[] {
+  const out: Excluded[] = []
+  for (const e of excluded) {
+    if (e.to <= from || e.from >= to) continue
+    out.push({ from: Math.max(e.from, from) - from, to: Math.min(e.to, to) - from })
+  }
+  return out
+}
+
+function scanDocumentMath(text: string, excluded: Excluded[], tables: Excluded[], cells: Excluded[]): MathRange[] {
+  if (!tables.length) return scanMath(text, excluded)
+  // 表外排除整张表格，表内逐格独立扫描，避免公式跨 `|` 格线或跨表格行配对破坏列结构。
+  const out = scanMath(text, [...excluded, ...tables])
+  for (const cell of cells) {
+    const slice = text.slice(cell.from, cell.to)
+    if (!/[$\\]/.test(slice)) continue
+    const inner = scanMath(slice, sliceExcluded(excluded, cell.from, cell.to))
+    for (const r of inner) {
+      out.push({ from: cell.from + r.from, to: cell.from + r.to, code: r.code, block: false })
+    }
+  }
+  out.sort((a, b) => a.from - b.from)
+  return out
+}
+
+function collectHighlight(
+  state: EditorState,
+  text: string,
+  ranges: DecorationRange[],
+  excluded: Excluded[],
+  tables: Excluded[] = [],
+  cells: Excluded[] = [],
+): void {
+  if (!text.includes('==')) return
+  const scanSlice = (slice: string, offset: number, blocked: Excluded[]) => {
+    const overlapsBlocked = (start: number, end: number) => blocked.some((e) => start < e.to && end > e.from)
+    HIGHLIGHT_RE.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = HIGHLIGHT_RE.exec(slice)) !== null) {
+      const start = offset + match.index
+      const end = start + match[0].length
+      if (overlapsBlocked(start, end)) continue
+      const active = isActiveLine(state, start)
+      // 藏定界符，给中间那段加底色；光标在这一行时定界符露出来，但仍要能认出来
+      const delimiter = (from: number, to: number) =>
+        active ? MARK({ class: 'cm-md-marker' }) : hide(from, to)
+      ranges.push({ from: start, to: start + 2, deco: delimiter(start, start + 2) })
+      ranges.push({ from: end - 2, to: end, deco: delimiter(end - 2, end) })
+      ranges.push({ from: start + 2, to: end - 2, deco: MARK({ class: 'cm-md-highlight' }) })
+    }
+  }
+  if (!tables.length) {
+    scanSlice(text, 0, excluded)
+    return
+  }
+  scanSlice(text, 0, [...excluded, ...tables])
+  for (const cell of cells) {
+    const slice = text.slice(cell.from, cell.to)
+    if (!slice.includes('==')) continue
+    scanSlice(slice, cell.from, excluded)
   }
 }
 
@@ -628,6 +833,11 @@ class TaskCheckboxWidget extends WidgetType {
 function collectTaskItems(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
   iterateContent(state, front, (node) => {
       if (node.name !== 'TaskMarker') return
+      // 所在列表标记后面必须跟普通空格才算成型待办（避免 `-\t[ ] ` 仅凭 Tab 就渲染成复选框）
+      let ancestor = node.node.parent
+      while (ancestor && ancestor.name !== 'ListItem') ancestor = ancestor.parent
+      const selfMark = ancestor?.getChild('ListMark')
+      if (selfMark && !hasListSpace(state, selfMark.to)) return
       // 复选框**始终**画成复选框，光标停在那一行也一样（#136）。
       // 别的标记在这一行会退回源码，好让人能改到标记本身；复选框不需要这样：
       // 勾没勾是点出来的，而 `- [ ]` 这几个字符没人会手敲，退回源码只是多一步。
@@ -779,292 +989,6 @@ function collectFrontmatter(
   ranges.push({ from: firstLine.from, to: firstLine.from, deco: Decoration.line({ class: 'cm-md-frontmatter-folded' }) })
 }
 
-// ─── 表格 ────────────────────────────────────────────────────────────────────
-
-/**
- * 表格画成真的 `<table>`。
- *
- * 为什么这里不像别的块一样「只加样式」：markdown 表格的单元格在源码里只是被 `|`
- * 隔开的文字，行是一个个独立的 div，**没有任何办法给单元格画边框、做对齐**。
- * 只加底色的结果是几条彩色横条，不是表格。Obsidian 与 Typora 都是把表格渲染成真表格，
- * 光标进去才回到源码，这里照做。
- *
- * 单元格点击使用原位编辑器。用键盘把正文光标移到表格源码区间时，仍显示源码。
- */
-class TableWidget extends WidgetType {
-  constructor(readonly source: string, readonly base: string | null, readonly node: SyntaxNode) {
-    super()
-  }
-
-  eq(other: TableWidget): boolean {
-    return other.source === this.source && other.base === this.base &&
-      other.node.from === this.node.from && other.node.to === this.node.to
-  }
-
-  toDOM(): HTMLElement {
-    const [head, alignment, ...body] = readTableSource(this.node, this.source)
-    const viewport = document.createElement('div')
-    viewport.className = 'cm-md-table-scroll'
-    const table = document.createElement('table')
-    table.className = 'cm-md-table-widget'
-    withSourceRange(table, this.node.from, this.node.to)
-    viewport.append(table)
-    if (!head || !alignment) {
-      table.textContent = this.source
-      return viewport
-    }
-    attachTableRows(table, [head, ...body])
-    const thead = document.createElement('thead')
-    const headRow = document.createElement('tr')
-    head.cells.forEach((cell, index) => {
-      const th = document.createElement('th')
-      th.style.textAlign = alignOf(alignment.cells[index]?.text ?? '')
-      appendTableCell(th, cell, this.base)
-      headRow.appendChild(th)
-    })
-    thead.appendChild(headRow)
-    table.appendChild(thead)
-    const tbody = document.createElement('tbody')
-    for (const row of body) {
-      const tr = document.createElement('tr')
-      for (let i = 0; i < head.cells.length; i++) {
-        const td = document.createElement('td')
-        td.style.textAlign = alignOf(alignment.cells[i]?.text ?? '')
-        appendTableCell(td, row.cells[i], this.base)
-        tr.appendChild(td)
-      }
-      tbody.appendChild(tr)
-    }
-    table.appendChild(tbody)
-    observeTableLayout(table, remeasureAfterDraw)
-    return viewport
-  }
-
-  destroy(dom: HTMLElement): void {
-    const table = dom.querySelector('table')
-    if (!table) return
-    stopObservingTableLayout(table)
-    finishRemovedTableEdit(table)
-  }
-}
-
-/** 分隔行里的对齐标记：`:---` 左、`:---:` 居中、`---:` 右。 */
-function alignOf(delimiter: string): string {
-  const cell = delimiter.trim()
-  const left = cell.startsWith(':')
-  const right = cell.endsWith(':')
-  if (left && right) return 'center'
-  if (right) return 'right'
-  return 'left'
-}
-
-/** 单元格复用正文的语法树，用文本节点和白名单标签构造 DOM。 */
-function appendTableCell(parent: HTMLElement, cell: CellSource | undefined, base: string | null): void {
-  if (!cell) return
-  const { text, from: start, to: end, syntax } = cell
-  const slice = (from: number, to: number) => text.slice(from - start, to - start)
-  const code = text.includes('$') ? excludedRanges(text, {
-    iterate: ({ enter }) => syntax?.cursor().iterate(node => enter({
-      name: node.name, from: node.from - start, to: node.to - start,
-    })),
-  }) : []
-  const math = scanMath(text, code)
-
-  function appendText(target: HTMLElement, from: number, to: number): void {
-    let cursor = from
-    for (const formula of math) {
-      const left = formula.from + start
-      const right = formula.to + start
-      if (left < cursor || right > to) continue
-      target.append(displayCellText(slice(cursor, left)), mathElement(displayCellText(formula.code), false))
-      cursor = right
-    }
-    if (cursor < to) target.append(displayCellText(slice(cursor, to)))
-  }
-
-  function renderNode(node: SyntaxNode): Node | null {
-    const raw = slice(node.from, node.to)
-    const first = node.firstChild
-    const last = node.lastChild
-    if (node.name === 'Escape' || node.name === 'Entity') return document.createTextNode(decodeString(raw))
-    if (node.name === 'HTMLTag' && /^<br\s*\/?>$/i.test(raw)) return document.createElement('br')
-    if (node.name === 'InlineCode' && first && last) {
-      const element = document.createElement('code')
-      const value = displayCellText(slice(first.to, last.from))
-      element.textContent = value.startsWith(' ') && value.endsWith(' ') && /[^ ]/.test(value) ? value.slice(1, -1) : value
-      return element
-    }
-    if (node.name === 'Link' || node.name === 'Image' || node.name === 'Autolink') {
-      const url = node.getChild('URL')
-      const [open, close] = node.getChildren('LinkMark')
-      if (!url || !open || !close) return null
-      const address = slice(url.from, url.to)
-      const href = node.name === 'Autolink' ? address : decodeDestination(address)
-      if (node.name === 'Image') {
-        const image = document.createElement('img')
-        image.alt = decodeString(slice(open.to, close.from))
-        if (!isSafeURL(href)) return image
-        image.src = resolveImageSrc(href, base)
-        // 独占一格的图片沿用正文的图注方式，混排内容可自行在图后写说明。
-        if (node.from !== start || node.to !== end || !image.alt.trim()) return image
-        const figure = document.createElement('figure')
-        figure.className = 'cm-md-table-image'
-        const caption = document.createElement('figcaption')
-        caption.className = 'cm-md-image-caption'
-        caption.textContent = image.alt
-        image.addEventListener('error', () => caption.remove(), { once: true })
-        figure.append(image, caption)
-        return figure
-      }
-      const link = document.createElement('a')
-      if (node.name === 'Autolink' || open.to === close.from) link.textContent = address
-      else appendChildren(link, node, open.to, close.from)
-      if (/^https?:\/\//i.test(href)) link.setAttribute('href', href)
-      return link
-    }
-    const tag = node.name === 'StrongEmphasis' ? 'strong'
-      : node.name === 'Emphasis' ? 'em' : node.name === 'Strikethrough' ? 's' : null
-    if (!tag || !first || !last) return null
-    const element = document.createElement(tag)
-    appendChildren(element, node, first.to, last.from)
-    return element
-  }
-
-  function appendChildren(target: HTMLElement, node: SyntaxNode | undefined, from: number, to: number): void {
-    let cursor = from
-    for (let child = node?.firstChild; child; child = child.nextSibling) {
-      const { from: left, to: right } = child
-      if (left < from || right > to) continue
-      // 公式先占区间，跨越语法节点时不能让强调或转义拆开公式。
-      if (math.some(formula => {
-        const formulaFrom = formula.from + start
-        const formulaTo = formula.to + start
-        return formulaFrom < right && formulaTo > left && (formulaFrom <= left || formulaTo >= right)
-      })) continue
-      const rendered = renderNode(child)
-      if (!rendered) continue
-      appendText(target, cursor, left)
-      target.appendChild(rendered)
-      cursor = right
-    }
-    appendText(target, cursor, to)
-  }
-
-  appendChildren(parent, syntax, start, end)
-}
-
-// Draft lines are table cell content. Even a line starting with # or > is inline text.
-const tableCellParser = markdownParser.configure({ parseBlock: [{
-  name: 'TableCellDraft',
-  before: 'LinkReference',
-  parse(context, line) {
-    const from = context.lineStart
-    const to = from + line.text.length
-    context.addElement(context.elt('Paragraph', from, to, context.parser.parseInline(line.text, from)))
-    context.nextLine()
-    return true
-  },
-}] })
-
-const cellFormatTags: Readonly<Partial<Record<string, string>>> = {
-  StrongEmphasis: 'strong', Emphasis: 'em', Strikethrough: 's', InlineCode: 'code',
-}
-
-class TableCellInlineWidget extends WidgetType {
-  constructor(readonly source: CellSource, readonly base: string | null) { super() }
-
-  eq(other: TableCellInlineWidget): boolean {
-    return other.source.text === this.source.text && other.base === this.base
-  }
-
-  toDOM(): HTMLElement {
-    const span = document.createElement('span')
-    appendTableCell(span, this.source, this.base)
-    return span
-  }
-}
-
-export function tableCellDraftPreview(parent: EditorState): Extension {
-  const base = parent.field(documentFileUrlField, false) ?? documentFileUrl
-  const decorate = (state: EditorState): DecorationSet => {
-    const text = state.doc.toString()
-    const tree = tableCellParser.parse(text)
-    const formulas = scanMath(text, excludedRanges(text, tree))
-      .filter(({ from, to }) => state.doc.lineAt(from).number === state.doc.lineAt(to).number)
-    const ranges: StateRange<Decoration>[] = []
-    const replace = (from: number, to: number, widget?: WidgetType) =>
-      ranges.push(Decoration.replace({ widget }).range(from, to))
-
-    for (const { from, to, code } of formulas) {
-      replace(from, to, new MathWidget(displayCellText(code), false, from, to))
-    }
-
-    tree.iterate({ enter(ref) {
-      const { name, from, to, node } = ref
-      if (name === 'Document' || name === 'Paragraph') return
-      if (formulas.some(formula => formula.from < to && from < formula.to && (from >= formula.from || to <= formula.to))) return false
-      const tag = cellFormatTags[name]
-      if (tag) {
-        const first = node.firstChild
-        const last = node.lastChild
-        if (first && last && first.to < last.from) {
-          replace(from, first.to)
-          replace(last.from, to)
-          ranges.push(MARK({ tagName: tag }).range(first.to, last.from))
-        }
-        if (name === 'InlineCode') return false
-      } else if (name === 'Link') {
-        const [open, close] = node.getChildren('LinkMark')
-        if (node.getChild('URL') && open && close && open.to < close.from) {
-          replace(from, open.to)
-          replace(close.from, to)
-          ranges.push(MARK({ class: 'cm-md-link' }).range(open.to, close.from))
-        }
-      } else if (name === 'Image' || name === 'Autolink' || name === 'Escape' || name === 'Entity' ||
-          (name === 'HTMLTag' && /^<br\s*\/?>$/i.test(text.slice(from, to)))) {
-        replace(from, to, new TableCellInlineWidget({ from, to, syntax: node.parent ?? undefined, text: text.slice(from, to) }, base))
-        return false
-      }
-    } })
-    return Decoration.set(ranges, true)
-  }
-  return StateField.define({
-    create: decorate,
-    // The cell follows the document's inline rendering rule across caret moves.
-    update: (decorations, tr) => tr.docChanged ? decorate(tr.state) : decorations,
-    provide: field => EditorView.decorations.from(field),
-  })
-}
-
-function collectTables(
-  state: EditorState,
-  ranges: DecorationRange[],
-  front: Range | null,
-  zones: ActiveZone[],
-): void {
-  iterateContent(state, front, (node) => {
-      if (node.name !== 'Table') return
-      zones.push({ from: node.from, to: node.to, kind: 'block' })
-      // 正文光标落在被替换的区间里时显示源码，原位单元格编辑有自己的输入焦点。
-      if (isBlockActive(state, node.from, node.to)) {
-        pushBlockLines(state, node.from, node.to, 'cm-md-table', ranges)
-        return false
-      }
-      ranges.push({
-        from: node.from,
-        to: node.to,
-        deco: Decoration.replace({
-          widget: new TableWidget(
-            state.doc.sliceString(node.from, node.to),
-            state.field(documentFileUrlField, false) ?? documentFileUrl,
-            node.node
-          )
-        }),
-      })
-      return false
-  })
-}
-
 // ─── 链接 ────────────────────────────────────────────────────────────────────
 
 /** 地址里的尖括号是 Markdown 包装，实体和反斜杠按显示地址解码。 */
@@ -1081,23 +1005,29 @@ function decodeDestination(raw: string): string {
  * 文字上带 `data-href`，而不是把整段换成 `<a>` widget：换成 widget 的话，链接文字里的
  * 加粗、行内代码就全没了。点击行为在 editor.ts 里，它认 `data-href`。
  */
+/** 链接里实际显示的文字范围，渲染和文字检索共同使用。 */
+export function linkTextRange(state: EditorState, node: SyntaxNode): Range | null {
+  const url = node.getChild('URL')
+  if (!url) return null
+  const cut = state.sliceDoc(node.from, url.from).lastIndexOf('](')
+  return cut > 1 ? { from: node.from + 1, to: node.from + cut } : null
+}
+
 function collectLinks(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
   iterateContent(state, front, (node) => {
     if (node.name !== 'Link') return
     // 引用式链接 `[文字][引用]` 和脚注 `[^note]` 都没有 URL 子节点：
     // 前者保持原样，后者交给脚注那一节画。
-    const url = node.node.getChild('URL')
-    if (!url) return false
+    const text = linkTextRange(state, node.node)
+    if (!text) return false
     if (isActiveRange(state, node.from, node.to)) return false
-    const [, labelEnd] = node.node.getChildren('LinkMark')
-    const textTo = labelEnd?.from ?? node.from
-    if (textTo <= node.from + 1) return false
+    const url = node.node.getChild('URL')!
     const href = decodeDestination(state.sliceDoc(url.from, url.to))
-    ranges.push({ from: node.from, to: node.from + 1, deco: hide(node.from, node.from + 1) })
-    ranges.push({ from: textTo, to: node.to, deco: hide(textTo, node.to) })
+    ranges.push({ from: node.from, to: text.from, deco: hide(node.from, text.from) })
+    ranges.push({ from: text.to, to: node.to, deco: hide(text.to, node.to) })
     ranges.push({
-      from: node.from + 1,
-      to: textTo,
+      from: text.from,
+      to: text.to,
       deco: MARK({ class: 'cm-md-link', attributes: href && isSafeURL(href) ? { 'data-href': href } : {} }),
     })
     return false
@@ -1186,6 +1116,30 @@ class HTMLWidget extends WidgetType {
   }
 }
 
+class TableBreakWidget extends HTMLWidget {
+  toDOM(): HTMLElement {
+    const wrap = super.toDOM()
+    wrap.classList.add('cm-md-table-break')
+    for (const side of ['before', 'after']) {
+      const anchor = document.createElement('span')
+      anchor.className = 'cm-md-table-caret-anchor'
+      anchor.dataset.side = side
+      anchor.setAttribute('aria-hidden', 'true')
+      if (side === 'before') wrap.prepend(anchor)
+      else wrap.append(anchor)
+    }
+    return wrap
+  }
+  get lineBreaks(): number { return 1 }
+  coordsAt(dom: HTMLElement, pos: number): Rect | null {
+    const anchor = dom.querySelector<HTMLElement>(`[data-side="${pos === 0 ? 'before' : 'after'}"]`)
+    if (!anchor) return null
+    const rect = anchor.getBoundingClientRect()
+    return { left: rect.left, right: rect.left, top: rect.top, bottom: rect.bottom }
+  }
+  ignoreEvent(): boolean { return false }
+}
+
 function collectHTML(
   state: EditorState,
   ranges: DecorationRange[],
@@ -1213,10 +1167,14 @@ function collectHTML(
         return false
       }
     }
+    let parent = node.node.parent
+    while (parent && parent.name !== 'TableCell') parent = parent.parent
+    const source = state.doc.sliceString(node.from, node.to)
+    const widget = parent && /^<br\s*\/?\s*>$/i.test(source) ? TableBreakWidget : HTMLWidget
     ranges.push({
       from: node.from,
       to: node.to,
-      deco: Decoration.replace({ widget: new HTMLWidget(state.doc.sliceString(node.from, node.to), block, node.from, node.to) }),
+      deco: Decoration.replace({ widget: new widget(source, block, node.from, node.to) }),
     })
     return false
   })
@@ -1234,7 +1192,12 @@ function inlinePair(state: EditorState, from: number, to: number): { closeFrom: 
   if (!styleAttr) return null
   const style = cleanStyle(styleAttr[1] ?? styleAttr[2] ?? '')
   if (!style) return null
-  const rest = state.doc.sliceString(to, state.doc.lineAt(from).to)
+  let limit = state.doc.lineAt(from).to
+  for (let node: SyntaxNode | null = syntaxTree(state).resolveInner(from, 1); node; node = node.parent) {
+    if (node.name === 'TableCell') { limit = Math.min(limit, node.to); break }
+    if (node.name === 'TableRow' || node.name === 'TableHeader' || node.name === 'Table') break
+  }
+  const rest = state.doc.sliceString(to, limit)
   const close = new RegExp(`</${open[1]}\\s*>`, 'i').exec(rest)
   if (!close) return null
   const closeFrom = to + close.index
@@ -1342,11 +1305,23 @@ function collectImages(state: EditorState, ranges: DecorationRange[], front: Ran
 
 // ─── 引用块与分隔线 ──────────────────────────────────────────────────────────
 
-function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Range | null, zones: ActiveZone[]): void {
+function collectBlocks(
+  state: EditorState,
+  ranges: DecorationRange[],
+  front: Range | null,
+  mathRanges: MathRange[],
+  zones: ActiveZone[],
+): void {
+  // 引用块里有没有字，按块起点记一次：同一块里的每个空 `>` 行都要问，不能每次重切整块。
+  const quoteHasText = new Map<number, boolean>()
   iterateContent(state, front, (node) => {
     switch (node.name) {
       case 'Blockquote': {
-        pushBlockLines(state, node.from, node.to, 'cm-md-blockquote', ranges)
+        // Lezer 的块终点可能停在最后一段正文；显式空引用行仍属于这个块，
+        // 尤其是刚按 Enter 补出的 `> `。不把下一条普通空行算进引用。
+        let end = state.doc.lineAt(node.to).number
+        while (end < state.doc.lines && /^[ \t]*(?:>[ \t]*)+$/.test(state.doc.line(end + 1).text)) end++
+        pushBlockLines(state, node.from, state.doc.line(end).to, 'cm-md-blockquote', ranges)
         break
       }
       case 'HorizontalRule': {
@@ -1361,19 +1336,23 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
       }
       case 'ListMark': {
         if (!hasListSpace(state, node.to)) break
+        const line = state.doc.lineAt(node.from)
+        const quoteLen = QUOTE_PREFIX_RE.exec(state.doc.sliceString(line.from, node.from))?.[0].length ?? 0
+        // 同一行里只渲染行首第一个列表标记：CommonMark 会把 `- - ` 解析成两层嵌套 ListMark，
+        // 导致同一行并排出现两个圆点（`• •`）。第二个起当普通正文字符保留。
+        const beforeMark = state.doc.sliceString(line.from + quoteLen, node.from)
+        if (/[^ \t]/.test(beforeMark)) break
         // 缩进只由一处分派：样式表按层级给左内边距（cm-md-li-N），所以源码里那几个
         // 空格在渲染模式下要藏起来。留着的话，排版是「CSS 缩进 + 源码空格」两份叠在
         // 一起：实测二级 56px、三级 88px，比旧引擎（每层 24px）多出三成，越深越夸张
         // （2026-11-07 橘子：「我不喜欢列表缩进那么多的排版…tab 之后，也太多了」）。
         // 引用里的列表跳过行首 `> `，那一段归 QuoteMark 自己藏，避免两份 replace 撞区间。
-        const line = state.doc.lineAt(node.from)
-        const quoteLen = QUOTE_PREFIX_RE.exec(state.doc.sliceString(line.from, node.from))?.[0].length ?? 0
         const hideFrom = line.from + quoteLen
         if (node.from > hideFrom) ranges.push({ from: hideFrom, to: node.from, deco: hide(hideFrom, node.from) })
         const raw = state.doc.sliceString(node.from, node.to).trim()
         // 待办项的圆点要去掉：它已经有复选框了，两个标记并排就是「• ☐ 文案」。
         const after = state.doc.sliceString(node.to, node.to + 4)
-        if (/^\s+\[[ xX]\]/.test(after)) {
+        if (/^ +\[[ xX]\]/.test(after)) {
           hideMarker(state, node.from, node.to, ranges, isActiveLine(state, node.from))
           break
         }
@@ -1393,6 +1372,39 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
       // CM6 没有 ul/ol/li 元素，缩进只能自己算；层级来自语法的嵌套深度。
       case 'ListItem': {
         pushListItemLines(state, node.node, ranges)
+        break
+      }
+      // CommonMark 规定空列表项（如紧跟普通段落下方刚敲完 `1. ` 或 `- ` 尚未打字）
+      // 不能打断段落，因此语法树会把它归进 Paragraph，导致敲完空格不出列表格式、
+      // 非得打字才出来。这里仅对顶层 Paragraph 里的空列表项立即补渲染，绝不误伤
+      // 普通折行里的 `2026. 敬请期待`、跨行行内代码、块公式或 ListItem 续行。
+      case 'Paragraph': {
+        if (node.node.parent?.name === 'ListItem') break
+        const tree = syntaxTree(state)
+        const startLine = state.doc.lineAt(node.from).number
+        const endLine = state.doc.lineAt(Math.max(node.from, node.to - 1)).number
+        for (let n = startLine; n <= endLine; n++) {
+          const line = state.doc.line(n)
+          const parsed = parseListLine(line.text)
+          if (!parsed || !parsed.isEmpty || parsed.box) continue
+          const markFrom = line.from + parsed.markerStart
+          const markTo = line.from + parsed.markerEnd
+          // 只处理纯段落文本里的空列表行，排除已识别的 ListMark、跨行行内代码/HTML 及数学公式
+          const inner = tree.resolveInner(markFrom, 1)
+          if (inner.name !== 'Paragraph') continue
+          if (mathRanges.some((m) => markFrom >= m.from && markFrom < m.to)) continue
+          const lineClass = parsed.kind === 'ordered'
+            ? 'cm-md-li cm-md-li-0 cm-md-li-ordered'
+            : 'cm-md-li cm-md-li-0'
+          ranges.push({ from: line.from, to: line.from, deco: Decoration.line({ class: lineClass }) })
+          const hideFrom = line.from + parsed.quoteLen
+          if (markFrom > hideFrom) ranges.push({ from: hideFrom, to: markFrom, deco: hide(hideFrom, markFrom) })
+          if (parsed.kind === 'bullet' && !isActiveLine(state, markFrom)) {
+            ranges.push({ from: markFrom, to: markTo, deco: Decoration.replace({ widget: new ListBulletWidget() }) })
+          } else {
+            ranges.push({ from: markFrom, to: markTo, deco: MARK({ class: 'cm-md-listmark' }) })
+          }
+        }
         break
       }
       case 'FencedCode': {
@@ -1433,10 +1445,22 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
       }
       case 'QuoteMark': {
         // `>` 在光标不在这一行时藏起来（连它后面的空格），引用就该只看到竖线与文字
-        // 例外：这一行除了 `>` 别的什么都没有。刚打出一个 `>` 就把它藏掉，屏幕上什么
-        // 都不剩，得再打个空格才出现引用竖线（2026-11-07 与标题同一个毛病）。
+        // 例外：这一行除了 `>` 别的什么都没有，而且整个引用块还一个字都没有。刚打出一个
+        // `>` 就把它藏掉，屏幕上什么都不剩，得再打个空格才出现引用竖线（2026-11-07 与
+        // 标题同一个毛病）。引用里已经有字时，空 `>` 行只是段落之间的分隔，照常藏起来，
+        // 否则两段引用中间会露出一个孤零零的 `>`。
         const rest = state.doc.sliceString(node.to, state.doc.lineAt(node.to).to)
-        if (rest.trim() === '' || isActiveLine(state, node.from)) {
+        const quote = node.node.parent
+        let emptyQuote = false
+        if (rest.trim() === '' && quote?.name === 'Blockquote') {
+          let known = quoteHasText.get(quote.from)
+          if (known === undefined) {
+            known = /[^>\s]/.test(state.doc.sliceString(quote.from, quote.to))
+            quoteHasText.set(quote.from, known)
+          }
+          emptyQuote = !known
+        }
+        if (emptyQuote || isActiveLine(state, node.from)) {
           ranges.push({ from: node.from, to: node.to, deco: MARK({ class: 'cm-md-quotemark' }) })
         } else {
           hideMarker(state, node.from, node.to, ranges)
@@ -1545,7 +1569,8 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
           break
         }
         case 'HeaderMark': {
-          if (node.node.parent?.name.startsWith('Setext')) break
+          // 仅隐藏 ATX 标题（`# `）标记；防止任何残留的非 ATX HeaderMark 误藏正文字符。
+          if (!node.node.parent?.name.startsWith('ATXHeading')) break
           // 标题的 `#` 连同后面那个空格一起藏，否则标题会比正文右移一个字
           hideMarker(state, from, to, ranges, active)
           break
@@ -1571,6 +1596,12 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
           // 围栏内嵌语言也可能有同名节点，只处理 Markdown 自己的行内节点。
           if (node.type !== markdownParser.nodeSet.types[node.type.id]) break
           const raw = state.sliceDoc(from, to)
+          if (node.name === 'Escape' && /^\\[\\|`]$/.test(raw)) {
+            // 表格编辑器单独跟踪这三种转义的光标、删除和撤销，只隐藏第一个字符。
+            let parent = node.node.parent
+            while (parent && parent.name !== 'TableCell') parent = parent.parent
+            if (parent) break
+          }
           const text = decodeString(raw)
           if (text !== raw) {
             const widget = new InlineCharacterWidget(text.replace(/[\t\n\r\f]/g, ' '))
@@ -1646,7 +1677,7 @@ let currentFlash: { from: number; to: number } | null = null
 interface ActiveZone {
   from: number
   to: number
-  kind: 'frontmatter' | 'block' | 'fence'
+  kind: 'frontmatter' | 'block' | 'inline' | 'fence'
 }
 
 const zonesByDeco = new WeakMap<DecorationSet, ActiveZone[]>()
@@ -1664,6 +1695,9 @@ function activeZonesKey(state: EditorState, zones: readonly ActiveZone[]): strin
     } else if (z.kind === 'fence') {
       const editing = codeFenceEdit(state, z.from, z.to)
       if (editing) parts.push(`${editing}:${z.from}:${z.to}`)
+    } else if (z.kind === 'inline') {
+      // 与 isInlineMathActive 同一判据：任一选区严格落在公式内部
+      if (state.selection.ranges.some((r) => r.from > z.from && r.to < z.to)) parts.push(`i:${z.from}:${z.to}`)
     } else if (main.from >= z.from && main.to <= z.to) {
       parts.push(`b:${z.from}:${z.to}`)
     }
@@ -1675,10 +1709,13 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
   const ranges: DecorationRange[] = []
   const zones: ActiveZone[] = []
   const text = state.doc.toString()
-  const excluded = excludedRanges(text, syntaxTree(state))
+  const needsScan = /[$\\]|==/.test(text)
+  const tree = syntaxTree(state)
+  const excluded = needsScan ? excludedRanges(text, tree) : []
   // 属性区的区间要算一次、多处用：压淡它、把它里面的 YAML 排出 markdown 排版、
   // 不让它的 `---` 被当成分页。
   const front = frontmatterRange(text)
+  const tableBounds = needsScan ? collectTableBounds(tree, front) : { tables: [], cells: [] }
 
   // Chromium's tagged PDF uses accessible headings for native outline destinations.
   if (exportingCleanly(state)) {
@@ -1693,7 +1730,8 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
     ranges.push({ from: flash.from, to: flash.to, deco: MARK({ class: 'cm-md-jump-flash' }) })
   }
 
-  collectBlocks(state, ranges, front, zones)
+  const mathRanges = /[$\\]/.test(text) ? scanDocumentMath(text, excluded, tableBounds.tables, tableBounds.cells) : []
+  collectBlocks(state, ranges, front, mathRanges, zones)
   collectLinks(state, ranges, front)
   collectFootnotes(state, text, ranges, front)
   collectHTML(state, ranges, front, zones)
@@ -1701,12 +1739,11 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
   collectPages(state, ranges, front)
   collectInline(state, ranges, front)
   collectFrontmatter(state, ranges, front, zones)
-  collectTables(state, ranges, front, zones)
   collectTaskItems(state, ranges, front)
   collectMermaid(state, text, ranges, front, zones)
-  collectHighlight(state, text, ranges, excluded)
+  collectHighlight(state, text, ranges, excluded, tableBounds.tables, tableBounds.cells)
   // 公式放最后：它覆盖区间，其它装饰不该插进它里面
-  collectMath(state, text, excluded, ranges, zones)
+  collectMath(state, mathRanges, ranges, zones)
 
   // 排序键必须带上 startSide：RangeSetBuilder 只接受按 (from, startSide) 递增的顺序，
   // 原来只按 (from, to) 排，同一段区间上挂了两种装饰时就翻车。
@@ -1730,6 +1767,8 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
  * 文档变化、解析推进、导出开关切换时重算；单纯移动光标或拖选文字时，只有跨进/跨出
  * 块级替换区（表格、图、块公式、HTML 块、属性区）才重算，避免大文档拖选卡死（#201）。
  */
+const tableBreakAtoms = new WeakMap<DecorationSet, DecorationSet>()
+
 export const livePreviewField = StateField.define<DecorationSet>({
   create: (state) => buildDecorations(state, null),
   update(deco, tr) {
@@ -1752,7 +1791,15 @@ export const livePreviewField = StateField.define<DecorationSet>({
     }
     return buildDecorations(tr.state, flashValue)
   },
-  provide: (field) => EditorView.decorations.from(field),
+  provide: (field) => [EditorView.decorations.from(field), EditorView.atomicRanges.of(view => {
+    const decorations = view.state.field(field)
+    let atoms = tableBreakAtoms.get(decorations)
+    if (!atoms) {
+      atoms = decorations.update({ filter: (_from, _to, value) => value.spec.widget instanceof TableBreakWidget })
+      tableBreakAtoms.set(decorations, atoms)
+    }
+    return atoms
+  })],
 })
 
 /** 解析往前推进之后，请重算一次装饰。 */
@@ -1772,12 +1819,18 @@ export const decorationsRefreshEffect = StateEffect.define<null>()
  * 插件直接崩掉（`Calls to EditorView.update are not allowed while an update is in progress`）。
  */
 const parseRefresh = ViewPlugin.fromClass(class {
-  private parsed = 0
+  private parsed: number
   private pending = false
   private attempts = 0
+  constructor(view: EditorView) {
+    this.parsed = syntaxTree(view.state).length
+  }
   update(update: ViewUpdate) {
     const tree = syntaxTree(update.state)
-    const grew = tree.length > this.parsed
+    // 先把旧终点放到新文档坐标里：输入增加的长度不是后台解析推进。
+    // 终点被替换时已没有可比较的位置，必须刷新，不能把插入区末尾当旧终点而漏掉新树。
+    const parsed = update.changes.mapPos(this.parsed, 1, MapMode.TrackDel)
+    const grew = parsed === null || tree.length > parsed
     this.parsed = tree.length
     const viewportEnd = update.view.viewport.to
     if (tree.length >= viewportEnd) {
@@ -1822,5 +1875,7 @@ export const livePreview: Extension = [
   readingModeField,
   documentFileUrlField,
   livePreviewField,
+  inlineMathAtomicRanges,
+  inlineMathNavigation,
   parseRefresh,
 ]

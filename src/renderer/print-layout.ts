@@ -39,7 +39,7 @@ const PAPER_RULES = `
 body.${PAPER_CLASS} #editor { height: auto !important; overflow: visible !important; }
 body.${PAPER_CLASS} #editor.hidden { display: block !important; }
 body.${PAPER_CLASS} #source-editor { display: none !important; }
-body.${PAPER_CLASS} #editor .cm-editor { height: auto !important; }
+body.${PAPER_CLASS} #editor .cm-editor { display: block !important; height: auto !important; }
 body.${PAPER_CLASS} #editor .cm-scroller { display: block !important; height: auto !important; overflow: visible !important; }
 body.${PAPER_CLASS} #editor .cm-pdf-copy { display: none; }
 body.${PAPER_CLASS} #editor .cm-pdf-copy.cm-pdf-measuring {
@@ -47,8 +47,8 @@ body.${PAPER_CLASS} #editor .cm-pdf-copy.cm-pdf-measuring {
   position: absolute;
   visibility: hidden;
 }
-#editor .cm-pdf-copy .cm-md-table-widget th { min-width: 0 !important; }
-#editor .cm-pdf-copy .cm-md-table-widget :is(th, td) { overflow-wrap: anywhere; word-break: break-word; }
+#editor .cm-pdf-copy .cm-md-table-cell { min-width: 0 !important; overflow-wrap: anywhere; word-break: break-word; }
+#editor .cm-pdf-copy .cm-md-table-measuring .cm-md-table-cell { white-space: nowrap !important; }
 @media print {
   body.${PAPER_CLASS} .cm-scroller:has(> .cm-pdf-copy) > .cm-content:not(.cm-pdf-copy) { display: none; }
   body.${PAPER_CLASS} #editor .cm-pdf-copy { display: block; width: 100%; }
@@ -147,6 +147,7 @@ export async function preparePdfDocument(pageWidths: PdfPageWidths): Promise<boo
   const copy = view.contentDOM.cloneNode(true) as HTMLElement
   copy.classList.add('cm-pdf-copy', 'cm-pdf-measuring')
   copy.removeAttribute('contenteditable')
+  copy.removeAttribute('data-table-layout')
   groupMultilinePdfHeadings(copy)
   copy.style.width = `${pageWidths.portrait}mm`
   view.scrollDOM.append(copy)

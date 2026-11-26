@@ -1,7 +1,8 @@
 import { distributeWidth, minimumWidth, type ColumnWidth } from '../shared/table-column-widths'
 
 export interface PdfTable {
-  table: HTMLTableElement
+  table: HTMLElement
+  rows: HTMLElement[][]
   columns: ColumnWidth[]
 }
 
@@ -9,12 +10,11 @@ const TABLE_SELECTOR = '.cm-md-table-widget'
 const MAX_SAMPLE_ROWS = 24
 const MAX_CELLS_TO_REFINE = 240
 
-function measureColumns(table: HTMLTableElement, headers: HTMLTableCellElement[]): ColumnWidth[] {
-  const body = Array.from(table.tBodies).flatMap((section) => Array.from(section.rows))
+function measureColumns(table: HTMLElement, [headers, ...body]: HTMLElement[][]): ColumnWidth[] {
   const stride = Math.max(1, Math.ceil(body.length / MAX_SAMPLE_ROWS))
   const rows = body.filter((_, index) => index % stride === 0)
   const measure = document.createRange()
-  const textWidth = (cell: HTMLTableCellElement) => {
+  const textWidth = (cell: HTMLElement) => {
     measure.selectNodeContents(cell)
     return measure.getBoundingClientRect().width
   }
@@ -26,7 +26,7 @@ function measureColumns(table: HTMLTableElement, headers: HTMLTableCellElement[]
       const em = parseFloat(style.fontSize)
       const padding = parseFloat(style.paddingInlineStart) + parseFloat(style.paddingInlineEnd) + 2
       const heading = textWidth(header)
-      const bodyWidths = rows.map((row) => textWidth(row.cells[index])).sort((a, b) => a - b)
+      const bodyWidths = rows.map((row) => textWidth(row[index])).sort((a, b) => a - b)
       const typical = bodyWidths[Math.floor((bodyWidths.length - 1) * 0.75)] ?? 0
       const headingTarget = heading <= 6 * em ? heading : heading / 2
       // Reserve room for short labels and values. Exceptionally long text can
@@ -41,12 +41,13 @@ function measureColumns(table: HTMLTableElement, headers: HTMLTableCellElement[]
 
 export function measurePdfTables(root: HTMLElement): PdfTable[] {
   const tables: PdfTable[] = []
-  for (const table of root.querySelectorAll<HTMLTableElement>(TABLE_SELECTOR)) {
-    const headers = Array.from(table.tHead?.rows[0]?.cells ?? [])
-    if (headers.length < 2 || table.querySelector('img, svg, .cm-md-math, [colspan], [rowspan]')) continue
-    if (Array.from(table.rows).some((row) => row.cells.length !== headers.length)) continue
-    table.style.tableLayout = 'fixed'
-    tables.push({ table, columns: measureColumns(table, headers) })
+  for (const table of root.querySelectorAll<HTMLElement>(TABLE_SELECTOR)) {
+    const rows = Array.from(table.querySelectorAll<HTMLElement>(':scope > .cm-md-table-row'), (row) =>
+      Array.from(row.querySelectorAll<HTMLElement>(':scope > .cm-md-table-cell')))
+    const headers = rows[0]
+    if (!headers || headers.length < 2 || table.querySelector('img:not(.cm-widgetBuffer), svg, .cm-md-math, [colspan], [rowspan]')) continue
+    if (rows.some((row) => row.length !== headers.length)) continue
+    tables.push({ table, rows, columns: measureColumns(table, rows) })
   }
   return tables
 }
@@ -55,26 +56,24 @@ export function needsLandscape(tables: PdfTable[]): boolean {
   return tables.some(({ table, columns }) => minimumWidth(columns) > table.clientWidth)
 }
 
-export function fitPdfTable({ table, columns }: PdfTable): void {
+export function fitPdfTable({ table, rows, columns }: PdfTable): void {
   const available = table.clientWidth
   if (available <= 0) return
 
-  const group = document.createElement('colgroup')
-  const elements = columns.map(() => group.appendChild(document.createElement('col')))
-  table.prepend(group)
+  table.style.tableLayout = 'fixed'
   const apply = (widths: number[]) => {
-    for (const [index, element] of elements.entries()) {
-      element.style.width = `${(widths[index] / available) * 100}%`
+    const percentages = widths.map((width) => `${(width / available) * 100}%`)
+    for (const row of rows) {
+      row.forEach((cell, index) => cell.style.setProperty('width', percentages[index], 'important'))
     }
   }
   const widths = distributeWidth(columns, available)
   apply(widths)
-  if (table.rows.length * columns.length > MAX_CELLS_TO_REFINE) return
+  if (rows.length * columns.length > MAX_CELLS_TO_REFINE) return
 
   // Try a small transfer from a column with room to spare. Use the browser's
   // wrapped row heights, including the header, to keep only a real improvement.
-  const rows = Array.from(table.rows)
-  const score = () => rows.reduce((sum, row) => sum + row.getBoundingClientRect().height, 0)
+  const score = () => rows.reduce((sum, row) => sum + (row[0].parentElement?.getBoundingClientRect().height ?? 0), 0)
   let bestScore = score()
   let best = widths
   const step = available * 0.035

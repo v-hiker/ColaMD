@@ -83,9 +83,9 @@ writeFileSync(docxPath, await markdownToDocx({
   theme: { font: 'serif', accent: '654383', tableHeader: 'EEE8F2', quoteBorder: 'D0D7DE' },
 }))
 
-function readPart(part) {
+function readPart(part, file = docxPath) {
   const [command, option] = process.platform === 'win32' ? ['tar', '-xOf'] : ['unzip', '-p']
-  return execFileSync(command, [option, docxPath, part]).toString('utf8')
+  return execFileSync(command, [option, file, part]).toString('utf8')
 }
 const xml = readPart('word/document.xml')
 const styles = readPart('word/styles.xml')
@@ -129,6 +129,29 @@ check('表格有固定列宽、主题表头和原生重复标题行', /w:tblLayo
 check('相邻表格之间有分隔段落', /<\/w:tbl><w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p><w:tbl>/.test(xml))
 check('表格图片及 Mermaid 为原生内嵌图，保留图片题注', (xml.match(/<w:drawing>/g) ?? []).length === 3
   && xml.includes('表格图片甲') && !xml.includes('flowchart LR'))
+
+// 5. 列表项以表格或代码开头时，后面的段落不能被提到它们前面
+const listFixture = [
+  '- | 表头甲 | 表头乙 |',
+  '  |---|---|',
+  '  | 格一 | 格二 |',
+  '',
+  '  表格后的段落',
+  '- ```',
+  '  代码行',
+  '  ```',
+  '',
+  '  代码后的段落',
+  '- 普通项文字',
+  '',
+].join('\n')
+const listPath = join(WORK, 'list.docx')
+writeFileSync(listPath, await markdownToDocx({ content: listFixture, sourcePath: null }))
+const listXml = readPart('word/document.xml', listPath)
+const at = (text) => listXml.indexOf(text)
+check('列表项里表格在后续段落之前', at('表头甲') >= 0 && at('表头甲') < at('表格后的段落'), `表格 ${at('表头甲')} 段落 ${at('表格后的段落')}`)
+check('列表项里代码在后续段落之前', at('代码行') >= 0 && at('代码行') < at('代码后的段落'), `代码 ${at('代码行')} 段落 ${at('代码后的段落')}`)
+check('以段落开头的项仍和符号同一行', /• <\/w:t>(?:(?!<\/w:p>).)*普通项文字/s.test(listXml))
 
 console.log(`\n${passed} passed / ${failed} failed`)
 if (failed > 0) process.exitCode = 1

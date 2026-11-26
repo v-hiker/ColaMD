@@ -1,8 +1,7 @@
-import { unified } from 'unified'
-import remarkParse from 'remark-parse'
-import remarkGfm from 'remark-gfm'
-import { GFM, parser as lezer } from '@lezer/markdown'
+import { parser as lezer } from '@lezer/markdown'
 import { createCjkEmphasis } from './cjk-emphasis'
+import { tableMarkdown } from './markdown-tables'
+import { parseMarkdownForWord } from './word-table-markdown'
 
 export interface MarkdownNode {
   type: string
@@ -15,18 +14,17 @@ export interface MarkdownNode {
   alt?: string
   align?: Array<'left' | 'right' | 'center' | null>
   children?: MarkdownNode[]
+  position?: { start: { offset?: number }; end: { offset?: number } }
 }
-
-const parser = unified().use(remarkParse).use(remarkGfm)
 
 export function parseWordMarkdown(markdown: string): MarkdownNode {
   // Remark implements standard CommonMark. Use the editor's detector to mark
   // the exact boundaries where we also allow emphasis adjacent to CJK quotes.
   const separator = ['\u2000', '\u2001', '\u2004', '\u2009', '\u202F'].find((space) => !markdown.includes(space))
-  if (!separator || !markdown.includes('*')) return parser.parse(markdown) as MarkdownNode
+  if (!separator || !markdown.includes('*')) return parseMarkdownForWord(markdown)
   const boundaries = new Set<number>()
-  lezer.configure([GFM, createCjkEmphasis((position) => boundaries.add(position))]).parse(markdown)
-  if (!boundaries.size) return parser.parse(markdown) as MarkdownNode
+  lezer.configure([...tableMarkdown, createCjkEmphasis((position) => boundaries.add(position))]).parse(markdown)
+  if (!boundaries.size) return parseMarkdownForWord(markdown)
 
   const pieces: string[] = []
   let previous = 0
@@ -35,7 +33,7 @@ export function parseWordMarkdown(markdown: string): MarkdownNode {
     previous = position
   }
   pieces.push(markdown.slice(previous))
-  const tree = parser.parse(pieces.join('')) as MarkdownNode
+  const tree = parseMarkdownForWord(pieces.join(''))
   const restoreText = (node: MarkdownNode) => {
     if (node.type === 'text' && node.value) node.value = node.value.replaceAll(separator, '')
     if (node.type === 'image' && node.alt) node.alt = node.alt.replaceAll(separator, '')

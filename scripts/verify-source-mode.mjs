@@ -329,7 +329,6 @@ try {
     if (document.getElementById('file-panel').hidden) document.getElementById('file-toggle-btn').click()
     document.getElementById('file-panel-outline').click()
     const content = v.contentDOM
-    const table = content.querySelector('.cm-md-table-widget')
     const html = window.__colamdExportDocumentHTML()
     const exported = new DOMParser().parseFromString(html, 'text/html')
     return {
@@ -338,13 +337,13 @@ try {
       underlines: [...content.querySelectorAll('.cm-md-heading-underline')].map(line => line.getBoundingClientRect().height),
       bodyHrefs: [...content.querySelectorAll('.cm-md-link[data-href]')].map(link => link.dataset.href),
       unsafeHref: !!exported.querySelector('a[href^="javascript:"]'),
-      header: table?.querySelector('th')?.textContent,
-      strong: table?.querySelector('strong')?.textContent,
-      code: table?.querySelector('code')?.textContent,
-      nested: table?.querySelector('em strong')?.textContent,
-      math: !!table?.querySelector('.katex'),
-      lineBreak: !!table?.querySelector('br'),
-      tableHref: table?.querySelector('a')?.getAttribute('href'),
+      header: exported.querySelector('th')?.textContent.trim(),
+      strong: exported.querySelector('td strong')?.textContent,
+      code: exported.querySelector('td code')?.textContent.trim(),
+      nested: exported.querySelector('td em strong, td strong em')?.textContent,
+      math: !!content.querySelector('.cm-md-table-cell .katex'),
+      lineBreak: !!content.querySelector('.cm-md-table-cell br'),
+      tableHref: exported.querySelector('td a')?.getAttribute('href'),
     }
   })()`)
   const headingLabels = ['第一节', '第二节 & 接下一行', '缩进行首标题']
@@ -355,7 +354,7 @@ try {
     JSON.stringify(compatibility.headings) === JSON.stringify(headingLabels.map((label, index) => ['H' + (index + 1), label])), compatibility)
   check('表格转义、实体、嵌套强调和多反引号代码按 Markdown 显示',
     compatibility.header === 'S&OP 计划' && compatibility.strong === '甲*乙* <b>' &&
-    compatibility.code === 'a ` b|c &amp;' && compatibility.nested === '嵌套强调', compatibility)
+    compatibility.code === 'a ` b\\|c &amp;' && compatibility.nested === '嵌套强调', compatibility)
   check('表格的公式和换行保持可用', compatibility.math && compatibility.lineBreak, compatibility)
   const compatibilityHref = 'https://example.com/read?a=1&b=2'
   check('正文和格内链接解码地址实体，危险协议没有生成链接',
@@ -463,13 +462,19 @@ try {
       for (const name of [...document.body.classList]) if (name.startsWith('theme-')) document.body.classList.remove(name)
       document.body.classList.add('theme-${theme}')
     })()`)
-    await waitFor("document.querySelector('.cm-md-table-widget td strong')", '渲染表格未就绪')
+    await waitFor("document.querySelector('.cm-md-table-cell .cm-md-strong')", '渲染表格未就绪')
     const { start, end, color } = await evaluate(`(() => {
-      const [first, last] = document.querySelectorAll('.cm-md-table-widget td')
-      const a = first.querySelector('strong'), b = last
+      const [first, last] = document.querySelectorAll('.cm-md-table-row:not(.cm-md-table-header) .cm-md-table-cell')
+      const a = first.querySelector('.cm-md-strong'), b = last
       const center = (el, offset) => {
         const range = document.createRange()
-        range.setStart(el.firstChild, offset)
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+        const texts = []
+        for (let node; (node = walker.nextNode());) {
+          if (!node.parentElement.closest('.cm-md-table-padding, .cm-md-table-marker')) texts.push(node)
+        }
+        const node = offset ? texts.at(-1) : texts[0]
+        range.setStart(node, offset ? node.length : 0)
         range.collapse(true)
         const r = range.getBoundingClientRect()
         return { x: r.x, y: r.y + r.height / 2 }
@@ -492,7 +497,7 @@ try {
     }
     await waitFor('window.tableCopy !== null', '复制快捷键未触发 copy')
     const selected = await evaluate(`({ selection: getSelection().toString(), text: window.tableCopy, stillRendered: !!document.querySelector('.cm-md-table-widget') })`)
-    check(`${theme} 阅读模式可跨单元格拖选并复制可见文本`, selected.stillRendered && selected.selection === '单元格甲\t单元格乙' && selected.text === selected.selection, selected)
+    check(`${theme} 阅读模式可跨单元格拖选并复制可见文本`, selected.stillRendered && /^单元格甲\s+单元格乙$/.test(selected.selection.trim()) && selected.text === '单元格甲\t单元格乙', selected)
     check(`${theme} 表格原生选区可见`, color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent', color)
   }
   await readingToggle()
@@ -500,147 +505,12 @@ try {
     getSelection().removeAllRanges()
     document.body.classList.replace('theme-light', ${JSON.stringify(originalTheme ?? 'theme-light')})
   })()`)
-  const clickCell = async (column) => {
-    const cell = await evaluate(`(() => {
-      const r = document.querySelector('.cm-md-table-widget tbody tr').cells[${column}].getBoundingClientRect()
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
-    })()`)
-    for (const type of ['mousePressed', 'mouseReleased']) {
-      await send('Input.dispatchMouseEvent', { type, ...cell, button: 'left', clickCount: 1 })
-    }
-  }
   const pressEditorKey = async (key, windowsVirtualKeyCode, modifiers = 0) => {
     const code = key.length === 1 ? 'Key' + key.toUpperCase() : key
     for (const type of ['rawKeyDown', 'keyUp']) {
       await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode, modifiers })
     }
   }
-  const cellDraft = 'document.activeElement.closest(".cm-md-table-cell-input") && document.activeElement.cmTile.root.view'
-  await clickCell(0)
-  await send('Input.insertText', { text: ' | 备注' })
-  check('表格保持渲染，输入即显示在当前格且提交前原文不变', await evaluate(`
-    (${cellDraft})?.state.doc.toString() === '**单元格甲** | 备注' &&
-    document.querySelector('.cm-md-table-widget tbody td:nth-child(2)').textContent === '单元格乙' &&
-    v.state.doc.toString() === ${JSON.stringify(readingEdited)}
-  `))
-  const cellThemes = await evaluate(`(async () => {
-    const content = document.activeElement
-    const input = content.closest('.cm-md-table-cell-input')
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-    const original = [...document.body.classList].find(name => name.startsWith('theme-'))
-    const colors = []
-    for (const theme of ['light', 'dark']) {
-      if (original) document.body.classList.remove(original)
-      document.body.classList.add('theme-' + theme)
-      const box = input.getBoundingClientRect()
-      const cell = input.parentElement.getBoundingClientRect()
-      const widthDelta = Math.abs(box.width - cell.width)
-      const heightDelta = Math.abs(box.height - cell.height)
-      const cursor = input.querySelector('.cm-cursor-primary')
-      const bounds = cursor?.getBoundingClientRect()
-      const cursorColor = cursor && getComputedStyle(cursor).borderLeftColor
-      const caretVisible = bounds?.width > 0 && bounds.height > 0 &&
-        bounds.left >= box.left && bounds.right <= box.right &&
-        bounds.top >= box.top && bounds.bottom <= box.bottom &&
-        cursorColor === getComputedStyle(content).color
-      colors.push({ background: getComputedStyle(input).backgroundColor, aligned: widthDelta < 3 && heightDelta < 3, widthDelta, heightDelta, caretVisible, cursorColor })
-      document.body.classList.remove('theme-' + theme)
-    }
-    if (original) document.body.classList.add(original)
-    return colors
-  })()`)
-  check('单元格输入框在浅色和深色主题中贴合网格', cellThemes.every(style => style.aligned) &&
-    cellThemes[0].background !== cellThemes[1].background, cellThemes)
-  check('编辑单元格时光标在深浅主题中可见', cellThemes.every(style => style.caretVisible), cellThemes)
-  await pressEditorKey('Tab', 9)
-  const cellEdited = readingEdited.replace('**单元格甲**', '**单元格甲** \\| 备注')
-  check('Tab 确认后只写回当前格，竖线显示为文字并进入下一格', await evaluate(`
-    v.state.doc.toString() === ${JSON.stringify(cellEdited)} &&
-    document.querySelector('.cm-md-table-widget tbody tr').cells.length === 2 &&
-    document.querySelector('.cm-md-table-widget tbody td').textContent === '单元格甲 | 备注' &&
-    (${cellDraft})?.state.doc.toString() === '单元格乙'
-  `))
-  await send('Input.insertText', { text: '放弃的输入' })
-  await pressEditorKey('Enter', 13, 8)
-  check('Shift+Enter 在当前格草稿内换行', await evaluate(
-    `(${cellDraft})?.state.doc.toString() === ${JSON.stringify('单元格乙放弃的输入\n')}`,
-  ))
-  await pressEditorKey('Escape', 27)
-  check('Esc 取消当前格的输入', await evaluate(`!document.querySelector('.cm-md-table-cell-input') &&
-    v.state.doc.toString() === ${JSON.stringify(cellEdited)}`))
-
-  await clickCell(1)
-  await evaluate(`(() => { const draft = ${cellDraft}; draft.dispatch({ selection: { anchor: 0, head: draft.state.doc.length } }) })()`)
-  const editedMarkup = '**新的说明** [链接](https://example.com) 与 $x_1$ 和 ' + String.fromCharCode(96) + '字段' + String.fromCharCode(96)
-  await send('Input.insertText', { text: editedMarkup })
-  check('当前格边输入边渲染且提交前只改草稿', await evaluate(`(() => {
-    const content = document.activeElement
-    return content.querySelector('strong')?.textContent === '新的说明' &&
-      content.querySelector('.cm-md-link')?.textContent === '链接' &&
-      !!content.querySelector('.cm-md-math .katex') &&
-      content.querySelector('code')?.textContent === '字段' &&
-      v.state.doc.toString() === ${JSON.stringify(cellEdited)}
-  })()`))
-  check('光标移入格式片段时，单元格和正文一样保持渲染', await evaluate(`(() => {
-    const content = document.activeElement
-    const draft = ${cellDraft}
-    const text = draft.state.doc.toString()
-    const positions = ['新的说明', '链接', 'x_1', '字段'].map(label => text.indexOf(label) + 1)
-    return positions.every(anchor => {
-      draft.dispatch({ selection: { anchor } })
-      return draft.state.selection.main.head === anchor &&
-        content.querySelector('strong')?.textContent === '新的说明' &&
-        content.querySelector('.cm-md-link')?.textContent === '链接' &&
-        !!content.querySelector('.cm-md-math .katex') &&
-        content.querySelector('code')?.textContent === '字段' &&
-        !content.textContent.includes('https://example.com')
-    })
-  })()`))
-  await pressEditorKey('Enter', 13)
-  const formattedCell = cellEdited.replace('单元格乙', editedMarkup)
-  check('Enter 确认后渲染当前格的 Markdown 格式', await evaluate(`
-    v.state.doc.toString() === ${JSON.stringify(formattedCell)} &&
-    document.querySelector('.cm-md-table-widget td:nth-child(2) strong')?.textContent === '新的说明'
-  `))
-  await pressEditorKey('z', 90, process.platform === 'darwin' ? 4 : 2)
-  check('撤销只还原最近一次单元格确认', await evaluate(`v.state.doc.toString() === ${JSON.stringify(cellEdited)}`))
-
-  await clickCell(1)
-  await send('Input.insertText', { text: '待确认' })
-  const sourceAfterCell = cellEdited.replace('单元格乙', '单元格乙待确认')
-  const editedCellStart = sourceAfterCell.indexOf('单元格乙待确认')
-  await toggle('source', editedCellStart)
-  check('切到源码前确认单元格并定位该格', await evaluate(`(() => {
-    const source = document.getElementById('source-editor')
-    return source.value === ${JSON.stringify(sourceAfterCell)} && source.selectionStart === ${editedCellStart}
-  })()`))
-  await toggle('render', editedCellStart)
-  await readingToggle()
-  check('在表格源码内开启阅读模式会恢复表格渲染', await evaluate(`v.state.readOnly && !!document.querySelector('.cm-md-table-widget')`))
-  await readingToggle()
-  await evaluate(`v.dispatch({ selection: { anchor: 0 } })`)
-  await clickCell(1)
-  await send('Input.insertText', { text: '点走' })
-  const headingPoint = await evaluate(`(() => {
-    const r = document.querySelector('#editor .cm-md-atxheading1').getBoundingClientRect()
-    return { x: r.left + 16, y: r.top + r.height / 2 }
-  })()`)
-  for (const type of ['mousePressed', 'mouseReleased']) {
-    await send('Input.dispatchMouseEvent', { type, ...headingPoint, button: 'left', clickCount: 1 })
-  }
-  const cellAfterBlur = sourceAfterCell.replace('待确认', '待确认点走')
-  check('点到格外确认当前草稿', await evaluate(`!document.querySelector('.cm-md-table-cell-input') &&
-    v.state.doc.toString() === ${JSON.stringify(cellAfterBlur)}`))
-
-  await clickCell(1)
-  await send('Input.insertText', { text: '切标签' })
-  const cellBeforeLeaving = cellAfterBlur.replace('点走', '点走切标签')
-  await evaluate(`document.querySelector('[data-tab-id="'+${JSON.stringify(tabB)}+'"]').click()`)
-  await waitFor(`document.querySelector('.tab-entry.active').dataset.tabId===${JSON.stringify(tabB)} &&
-    v.state.doc.toString()===${JSON.stringify(textB)}`, '切标签前未确认表格内容')
-  check('切标签前确认编辑，并且只保存到原文件', readFileSync(readingFile, 'utf8') === cellBeforeLeaving &&
-    readFileSync(fileB, 'utf8') === textB && statSync(fileB).mtimeMs === mtimeB)
-
   const previewImage = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000"><rect width="1600" height="1000" fill="#345"/></svg>').toString('base64')
   const wideTableText = [
     '# 窄窗口中的表格', '',
@@ -654,9 +524,15 @@ try {
   await openFixture(wideTableFile, wideTableText)
   await readingToggle()
   await send('Emulation.setDeviceMetricsOverride', { width: 480, height: 780, deviceScaleFactor: 1, mobile: false })
-  await waitFor("document.querySelector('.cm-md-table-scroll img')?.naturalWidth === 1600", '表格图片未加载')
+  await waitFor("document.querySelector('.cm-md-table-scroll img:not(.cm-widgetBuffer)')?.naturalWidth === 1600", '表格图片未加载').catch(async error => {
+    const picture = await evaluate(`({ tables: document.querySelectorAll('.cm-md-table-widget').length,
+      scrollers: document.querySelectorAll('.cm-md-table-scroll').length,
+      images: Array.from(v.contentDOM.querySelectorAll('img[alt="表内图注"]'), img => ({ width: img.naturalWidth, inside: !!img.closest('.cm-md-table-scroll') })),
+      cell: v.contentDOM.querySelector('.cm-md-table-last')?.innerText })`)
+    throw new Error(error.message + ' ' + JSON.stringify(picture))
+  })
   const galleryPoint = await evaluate(`(() => {
-    const rect = document.querySelector('.cm-md-table-scroll img').getBoundingClientRect()
+    const rect = document.querySelector('.cm-md-table-scroll img:not(.cm-widgetBuffer)').getBoundingClientRect()
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
   })()`)
   for (const type of ['mousePressed', 'mouseReleased']) {
@@ -665,7 +541,7 @@ try {
   await waitFor("document.querySelector('.cm-image-overlay.open img')?.naturalWidth === 1600", '单击表格图片未打开原图')
   check('阅读模式单击格内图打开带图注的原图', await evaluate(`
     document.querySelector('.cm-image-overlay.open img').alt === '表内图注' &&
-    !document.querySelector('.cm-md-table-cell-input')`))
+    !document.querySelector('.cm-md-table-input')`))
   await evaluate(`(() => {
     const image = document.querySelector('.cm-image-overlay.open img')
     image.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
@@ -681,19 +557,28 @@ try {
   await pressEditorKey('Escape', 27)
   await waitFor("!document.querySelector('.cm-image-overlay.open')", '未关闭原图查看器')
   const tablePoint = await evaluate(`(() => {
-    const rect = document.querySelector('.cm-md-table-scroll').getBoundingClientRect()
+    const rect = document.querySelector('.cm-md-table-scroll:has(.cm-md-table-header)').getBoundingClientRect()
     return { x: rect.left + rect.width / 2, y: rect.top + 24 }
   })()`)
   await send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...tablePoint, deltaX: 1000, deltaY: 0 })
-  await waitFor("document.querySelector('.cm-md-table-scroll').scrollLeft > 0", '宽表格没有横向滚动')
-  check('窄窗口横向滚动只移动表格，长参数名可读', await evaluate(`(() => {
-    const wrap = document.querySelector('.cm-md-table-scroll')
-    const code = wrap.querySelector('code')
+  await waitFor("document.querySelector('.cm-md-table-scroll:has(.cm-md-table-header)').scrollLeft > 0", '宽表格没有横向滚动').catch(async error => {
+    const geometry = await evaluate(`Array.from(document.querySelectorAll('.cm-md-table-scroll'), e => ({
+      w: e.clientWidth, scroll: e.scrollWidth, overflow: getComputedStyle(e).overflowX,
+      min: Array.from(e.querySelectorAll('.cm-md-table-header .cm-md-table-cell'), c => getComputedStyle(c).minWidth)
+    }))`)
+    throw new Error(error.message + ' ' + JSON.stringify(geometry))
+  })
+  const narrowScroll = await evaluate(`(() => {
+    const wrap = document.querySelector('.cm-md-table-scroll:has(.cm-md-table-header)')
+    const code = wrap.querySelector('.cm-md-inlinecode')
     const text = document.createRange()
     text.selectNodeContents(code)
-    return wrap.scrollLeft > 0 && v.scrollDOM.scrollLeft === 0 &&
-      v.scrollDOM.scrollWidth <= v.scrollDOM.clientWidth + 1 && text.getClientRects().length === 1
-  })()`))
+    return { tableScroll: wrap.scrollLeft, pageScroll: v.scrollDOM.scrollLeft,
+      pageWidth: v.scrollDOM.clientWidth, pageContentWidth: v.scrollDOM.scrollWidth,
+      codeLines: new Set(Array.from(text.getClientRects(), rect => Math.round(rect.top))).size }
+  })()`)
+  check('窄窗口横向滚动只移动表格，长参数名可读', narrowScroll.tableScroll > 0 &&
+    narrowScroll.pageScroll === 0 && narrowScroll.pageContentWidth <= narrowScroll.pageWidth + 1 && narrowScroll.codeLines === 1, narrowScroll)
   await readingToggle()
   await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 780, deviceScaleFactor: 1, mobile: false })
 
@@ -713,34 +598,23 @@ try {
   const layoutFile = join(runtime, 'table-layout.md')
   writeFileSync(layoutFile, layoutText)
   await openFixture(layoutFile, layoutText)
-  await evaluate(`window.measureTables = () => Array.from(document.querySelectorAll('.cm-md-table-widget'), (table, index) => {
+  await evaluate(`window.measureTables = () => Array.from(document.querySelectorAll('.cm-md-table-widget:has(.cm-md-table-header)'), (table, index) => {
     const column = index === 0 ? 0 : 2
-    const countLines = (cell) => {
+    const labels = Array.from(table.querySelectorAll('.cm-md-table-row:not(.cm-md-table-header) .cm-md-table-cell[data-column="' + column + '"] .cm-md-strong'))
+    const lineCount = (label) => {
       const range = document.createRange()
-      range.selectNodeContents(cell.querySelector('strong') || cell)
-      return Math.max(1, range.getClientRects().length)
+      range.selectNodeContents(label)
+      return new Set(Array.from(range.getClientRects(), rect => Math.round(rect.top))).size
     }
-    const size = () => ({
-      wrappedLabels: Array.from(table.tBodies[0].rows).filter(row => countLines(row.cells[column]) > 1).length,
-      lines: Array.from(table.rows).reduce((sum, row) => sum + Array.from(row.cells).reduce((subtotal, cell) => subtotal + countLines(cell), 0), 0),
-      fits: table.offsetWidth <= table.parentElement.clientWidth + 1,
-    })
-    const adjusted = size()
-    const headers = Array.from(table.tHead.rows[0].cells)
-    const widths = headers.map(th => th.style.getPropertyValue('--cm-md-column-min-width'))
-    for (const th of headers) th.style.removeProperty('--cm-md-column-min-width')
-    const automatic = size()
-    headers.forEach((th, i) => { if (widths[i]) th.style.setProperty('--cm-md-column-min-width', widths[i]) })
-    return { adjusted, automatic, widths }
+    return { wrappedLabels: labels.filter(label => lineCount(label) > 1).length, fits: table.offsetWidth <= table.parentElement.clientWidth + 1 }
   })`)
   const layoutWide = await evaluate('measureTables()')
-  check('根据实际折行改善短文本列，列名和位置不影响判断', layoutWide.length === 2 && layoutWide.every(({ adjusted, automatic }) =>
-    adjusted.fits && adjusted.wrappedLabels === 0 && automatic.wrappedLabels > 0 && adjusted.lines < automatic.lines), layoutWide)
+  check('短标签列按内容分配宽度，列名和位置不影响判断', layoutWide.length === 2 &&
+    layoutWide.every(table => table.fits && table.wrappedLabels === 0), layoutWide)
   await send('Emulation.setDeviceMetricsOverride', { width: 600, height: 780, deviceScaleFactor: 1, mobile: false })
   await evaluate('viewportProbe.settle("render", 0)')
   const layoutNarrow = await evaluate('measureTables()')
-  check('窗口变窄后重新分配列宽并保持表格放得下', layoutNarrow.length === 2 && layoutNarrow.every(({ adjusted, automatic }) =>
-    adjusted.fits && adjusted.lines <= automatic.lines), layoutNarrow)
+  check('窗口变窄后重新分配列宽', layoutNarrow.length === 2 && layoutNarrow.every(table => table.fits), layoutNarrow)
   await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 780, deviceScaleFactor: 1, mobile: false })
 
   const cjkText = [
@@ -810,6 +684,109 @@ try {
     v.state.readOnly && !v.contentDOM.querySelector('.cm-md-codeinfo, .code-language-btn')
   `))
   await readingToggle()
+
+  // 空格子由格里的临时输入框接收输入。切回渲染后焦点若停在编辑器本体，光标会撑满整格，
+  // 打的字落进下一行。缺省格在源码里只有行尾一个位置，切回后落在第一个缺省格。
+  const tableText = '| 编号 | 名称 | 备注 |\n|---|---|---|\n| 0008 | 团队订阅 |  |\n| 0009 | 笔记本 | 常规订单。 |\n| 缺省 |\n'
+  const tableFile = join(runtime, 'empty-cell.md')
+  writeFileSync(tableFile, tableText)
+  await openFixture(tableFile, tableText)
+  const clickCell = async (row, column) => {
+    const box = await evaluate(`(()=>{const r=document.querySelectorAll('.cm-md-table-row')[${row}].querySelectorAll('.cm-md-table-cell')[${column}].getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2}})()`)
+    for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...box, button: 'left', clickCount: 1 })
+  }
+  const cellFocused = (row, column) => `(()=>{const a=document.activeElement;return a.classList.contains('cm-md-table-input')&&a.closest('.cm-md-table-row').dataset.tableRow==='${row}'&&a.closest('.cm-md-table-cell').dataset.column==='${column}'&&getComputedStyle(document.querySelector('.cm-cursorLayer')).display==='none'})()`
+  const roundTrip = async (name, row, column, landing) => {
+    await clickCell(row, column)
+    await waitFor(cellFocused(row, column), name + '点击后未进入格内输入')
+    const head = await evaluate('v.state.selection.main.head')
+    await toggle('source', head)
+    check(name + '渲染→源码光标在格子位置', await evaluate(`document.getElementById('source-editor').selectionStart`) === head)
+    const back = await toggle('render', head)
+    const ready = await evaluate(`(async()=>{for(let i=0;i<60;i++){if(${cellFocused(row, landing)})return true;await new Promise(resolve => setTimeout(resolve, 16))}return false})()`)
+    const caret = await evaluate(`(()=>{const cell=document.querySelectorAll('.cm-md-table-row')[${row}].querySelectorAll('.cm-md-table-cell')[${landing}],c=v.coordsAtPos(v.state.selection.main.head,v.state.selection.main.assoc||1);return{height:c&&c.bottom-c.top,input:cell.querySelector('.cm-md-table-input').getBoundingClientRect().height,cell:cell.getBoundingClientRect().height}})()`)
+    transcript.cases.push({ name, back, caret })
+    check(name + '源码往返后由格内输入框接住焦点', ready && back.selection.head === head, { active: await evaluate('document.activeElement.className'), back })
+    // 缺省格挤在行尾同一个位置，没有单独的光标几何；只有真实空格子有
+    if (column === landing && row !== 3) check(name + '源码往返后光标高度是一行而不是整格', caret.height > 0 && caret.height <= caret.input + 1, caret)
+  }
+  await roundTrip('空格子', 1, 2, 2)
+  await send('Input.insertText', { text: 'Z' })
+  await waitFor(`v.state.doc.toString()!==${JSON.stringify(tableText)}`, '空格子输入没有写入')
+  const typedEmpty = (await evaluate('v.state.doc.toString()')).split('\n')
+  check('空格子源码往返后输入写进原格', /^\| 0008 \| 团队订阅 \|\s*Z\s*\|$/.test(typedEmpty[2]) && typedEmpty[3] === '| 0009 | 笔记本 | 常规订单。 |', typedEmpty)
+  await roundTrip('第二个缺省格', 3, 2, 1)
+  await roundTrip('第一个缺省格', 3, 1, 1)
+  await send('Input.insertText', { text: 'Y' })
+  await waitFor(`/缺省 \\|\\s*Y/.test(v.state.doc.toString())`, '缺省格输入没有写入')
+  const typedMissing = (await evaluate('v.state.doc.toString()')).split('\n')
+  check('缺省格源码往返后输入补齐整行', typedMissing[4] === '| 缺省 | Y |  |' && typedMissing.length === tableText.split('\n').length, typedMissing)
+
+  // #189：源码模式下，含大量软折行段落时，大纲点击跳转、滚动高亮同步与查找定位都按真实折行位置算
+  const wrappedPara = '这是一段很长的中文与 English words 混排软折行段落，用来让逻辑行号与实际视觉高度彻底脱节。'.repeat(24)
+  const navText = [
+    '# 第一章 起点',
+    wrappedPara,
+    wrappedPara,
+    '## 第二章 中段',
+    wrappedPara,
+    wrappedPara,
+    '## 第三章 终点',
+    wrappedPara,
+    '文末锚点：源码查找目标词',
+  ].join('\n')
+  const navFile = join(runtime, 'source-nav-189.md')
+  writeFileSync(navFile, navText)
+  await openFixture(navFile, navText)
+  await toggle('source', 0)
+  // 打开文件面板并切到大纲页签
+  await evaluate(`(() => {
+    if (!document.body.classList.contains('show-file-panel')) document.getElementById('file-toggle-btn').click()
+    document.getElementById('file-panel-outline').click()
+  })()`)
+  await waitFor(`document.querySelectorAll('#outline-list button').length === 3`, '源码大纲未渲染出 3 条标题')
+  // 1) 点击大纲「第三章 终点」，标题应落入视口且被选中
+  await evaluate(`document.querySelectorAll('#outline-list button')[2].click()`)
+  const h3Offset = navText.indexOf('## 第三章 终点')
+  const afterOutlineClick = await evaluate(`viewportProbe.settle('source', ${h3Offset})`)
+  check('#189 源码模式点击大纲跳转目标标题可见且选中',
+    afterOutlineClick.visible && afterOutlineClick.selection.anchor === h3Offset && afterOutlineClick.selection.head === h3Offset + '## 第三章 终点'.length,
+    afterOutlineClick)
+  // 2) 滚到「第二章 中段」真实顶部附近，大纲高亮应同步为第 2 项（索引 1）
+  const h2Offset = navText.indexOf('## 第二章 中段')
+  const spyIndex = await evaluate(`(async () => {
+    const ta = document.getElementById('source-editor')
+    const [rect] = viewportProbe.sourceCarets([${h2Offset}])
+    // 等大纲点击锁释放再触发手动滚动
+    await new Promise(r => setTimeout(r, 1700))
+    ta.scrollTop = Math.max(0, rect.top - ta.getBoundingClientRect().top - ta.clientTop + ta.scrollTop - 10)
+    ta.dispatchEvent(new Event('scroll'))
+    for (let i = 0; i < 6; i++) await new Promise(requestAnimationFrame)
+    const btns = [...document.querySelectorAll('#outline-list button')]
+    return btns.findIndex(b => b.classList.contains('active'))
+  })()`)
+  check('#189 源码模式滚动大纲高亮同步到真实折行章节', spyIndex === 1, { spyIndex })
+  // 3) 回到顶部后，用查找面板搜文末关键词，匹配项应主动滚进视口
+  const targetOffset = navText.indexOf('源码查找目标词')
+  await evaluate(`(() => {
+    const ta = document.getElementById('source-editor')
+    ta.scrollTop = 0
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, ctrlKey: true, bubbles: true }))
+  })()`)
+  const searchVisible = await evaluate(`(async () => {
+    const input = document.querySelector('.search-input')
+    if (!input) return { ok: false, reason: 'no input' }
+    input.value = '源码查找目标词'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    for (let i = 0; i < 4; i++) await new Promise(requestAnimationFrame)
+    const m = viewportProbe.measure('source', ${targetOffset})
+    // 关掉查找面板与侧栏以免影响后续用例
+    document.querySelector('.search-close')?.click()
+    if (document.body.classList.contains('show-file-panel')) document.getElementById('file-toggle-btn').click()
+    return { ok: m.visible && m.selection.anchor === ${targetOffset} && m.selection.head === ${targetOffset + '源码查找目标词'.length}, m }
+  })()`)
+  check('#189 源码模式查找命中远端关键词主动滚入视口', searchVisible.ok, searchVisible)
+  await toggle('render', 0)
 
   // 源码位置按真实排版测量，代价随光标前的文字线性增长。用接近整篇源码阈值
   // （512K 字符）的文档记录切换耗时，防止退化成多次全文排版。

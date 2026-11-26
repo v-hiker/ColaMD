@@ -1,9 +1,9 @@
 import { forceParsing } from '@codemirror/language'
 import type { ImageExportDestination } from '../preload/index'
-import { createEditor, focusEditor, finishTableCellEdit, tableCellEditSelection, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
+import { createEditor, finishEditorComposition, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, setReadingMode, openImageOverlay, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, remeasureEditor, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { withDiagramZoomPaused } from './editor/mermaid-bridge'
-import { jumpToSourceLine, sourcePositionTop } from './editor/source-line'
+import { jumpToSourceLine, sourceLineTops, sourcePositionTop } from './editor/source-line'
 import { documentHeadings } from './editor/heading-anchor'
 import { EditorView } from '@codemirror/view'
 import { documentHTMLFrom } from './editor/clean-html'
@@ -11,9 +11,9 @@ import { isPresenting, startSlideshow, stopSlideshow } from './slideshow'
 import { enterPrintLayout, exitPrintLayout } from './slides-export'
 import { enterPaperLayout, exitPaperLayout, preparePdfDocument, type PdfPageWidths } from './print-layout'
 import { SearchPanel } from './editor/search-panel'
-import { applyTheme, loadSavedTheme } from './themes/theme-manager'
+import { applyTheme, loadSavedTheme, onThemeChange } from './themes/theme-manager'
 import { setUiLanguage, isChinese, type UiLanguage } from './ui-language'
-import { applyEditorFont, clearEditorFont, loadSavedEditorFont, resetEditorFontSize, showFontSettingsModal, stepEditorFontSize } from './editor/font-settings'
+import { applyEditorFont, clearEditorFont, loadSavedEditorFont, onEditorFontChange, resetEditorFontSize, showFontSettingsModal, stepEditorFontSize } from './editor/font-settings'
 import './themes/base.css'
 import './themes/premium.css'
 import './themes/editor-preview.css'
@@ -322,10 +322,10 @@ function tabLabel(tab: DocumentTab): string {
 
 // Read the live state back into the active tab's record. Called before every
 // switch, close and bar render, so the records and the screen cannot disagree.
-function captureActiveTab(): void {
+function captureActiveTab(commitInput = false): void {
+  if (commitInput) finishEditorComposition()
   const tab = activeTab()
   if (!tab) return
-  finishTableCellEdit()
   // The path is the tab's identity and only changes where a document is really
   // opened or saved; deriving it here would let a stray render rename a tab.
   tab.dirty = dirty
@@ -568,7 +568,7 @@ function ensureTab(): DocumentTab {
 
 async function openNewTab(): Promise<void> {
   const previous = activeTab()
-  captureActiveTab()
+  captureActiveTab(true)
   if (!await saveTabForLeaving(previous)) return
   const tab: DocumentTab = {
     id: `tab-${nextTabId++}`,
@@ -622,7 +622,7 @@ async function activateTab(id: string): Promise<void> {
   const target = tabs.find((tab) => tab.id === id)
   if (!target) return
   const previous = activeTab()
-  captureActiveTab()
+  captureActiveTab(true)
   if (!await saveTabForLeaving(previous)) return
   switchingTab = true
   try {
@@ -695,7 +695,7 @@ async function closeTab(id: string): Promise<void> {
   if (index < 0) return
   const tab = tabs[index]
   if (tab.id === activeTabId) {
-    captureActiveTab()
+    captureActiveTab(true)
     if (!await saveTabForLeaving(tab)) return
     if (tab.dirty && !tab.filePath && !confirmDiscardUntitled()) return
   } else if (tab.dirty) {
@@ -745,7 +745,7 @@ async function openFileInNewTab(path: string): Promise<void> {
   }
   const current = activeTab()
   if (current && !current.filePath) {
-    finishTableCellEdit()
+    finishEditorComposition()
     if (!current.dirty) {
       await window.electronAPI.openSibling(path)
       return
@@ -945,7 +945,7 @@ async function runAutosave(): Promise<void> {
 }
 
 async function saveCurrent(saveAs = false): Promise<boolean> {
-  finishTableCellEdit()
+  finishEditorComposition()
   const revision = documentRevision
   const content = getFileContent()
   const expectedPath = currentFilePath
@@ -1086,6 +1086,7 @@ function caretViewportOffset(fraction: number, height: number, lineHeight: numbe
 }
 
 function toggleSourceMode(): void {
+  finishEditorComposition()
   if (sourceModeActive) {
     const ta = sourceEl()
     const { selectionStart, selectionEnd, selectionDirection } = ta
@@ -1099,6 +1100,8 @@ function toggleSourceMode(): void {
     if (view) {
       view.dispatch({
         selection: { anchor: backward ? selectionEnd : selectionStart, head },
+        // 用户主动切回渲染模式，单光标可让到可编辑边界；普通程序定位不做这个修正。
+        userEvent: 'select',
         effects: EditorView.scrollIntoView(head, {
           y: 'start',
           yMargin: caretViewportOffset(fraction, view.scrollDOM.clientHeight, view.defaultLineHeight),
@@ -1117,18 +1120,16 @@ function toggleSourceMode(): void {
       })
     }
   } else {
-    const cellPosition = finishTableCellEdit()
     const view = getEditorView()
     const main = view?.state.selection.main
-    const position = cellPosition ?? main?.head
+    const position = main?.head
     const rect = position !== undefined && view ? view.coordsAtPos(position, main?.assoc || 1) : null
     const scroller = editorScroller()
     const fraction = caretViewportFraction(rect ? rect.top - scroller.getBoundingClientRect().top - scroller.clientTop : null, scroller.clientHeight)
     enterSourceMode(getMarkdown())
     // 写入 value 会把光标挪到文末，焦点给了却停在那儿，一打字就跳到底
     const ta = sourceEl()
-    if (cellPosition !== null) ta.setSelectionRange(cellPosition, cellPosition)
-    else if (main) ta.setSelectionRange(main.from, main.to, main.head < main.anchor ? 'backward' : 'forward')
+    if (main) ta.setSelectionRange(main.from, main.to, main.head < main.anchor ? 'backward' : 'forward')
     ta.focus({ preventScroll: true })
     const head = position ?? ta.selectionEnd
     const style = getComputedStyle(ta)
@@ -1315,11 +1316,7 @@ function renderOutline(): void {
       if (!current) return
       if (sourceModeActive) {
         beginOutlineJump()
-        const source = sourceEl()
-        const lineHeight = Number.parseFloat(getComputedStyle(source).lineHeight) || 24
-        source.scrollTop = Math.max(0, (current.line ?? 0) * lineHeight - lineHeight)
-        source.focus()
-        revealSourceHeading(source, current.line ?? 0)
+        jumpToSourceLine(sourceEl(), (current.line ?? 0) + 1)
       } else if (current.line !== undefined) {
         // 视觉模式：交给编辑器自己跳，它会同时把光标放过去。
         // flashHeadingOnArrival 的信号靠编辑器内部的落点装饰发出，这里只管跳。
@@ -1439,32 +1436,36 @@ function visualActiveIndex(): number {
   return index
 }
 
+let sourceOutlineTopsCache: { value: string; width: number; key: string; tops: number[] } | null = null
+
+function getSourceOutlineTops(source: HTMLTextAreaElement): number[] {
+  const lines = outlineItems.map((item) => item.line ?? 0)
+  const key = lines.join(',')
+  if (
+    sourceOutlineTopsCache
+    && sourceOutlineTopsCache.value === source.value
+    && sourceOutlineTopsCache.width === source.clientWidth
+    && sourceOutlineTopsCache.key === key
+  ) {
+    return sourceOutlineTopsCache.tops
+  }
+  const tops = sourceLineTops(source, lines)
+  sourceOutlineTopsCache = { value: source.value, width: source.clientWidth, key, tops }
+  return tops
+}
+
 function sourceActiveIndex(): number {
   const source = sourceEl()
-  const lineHeight = Number.parseFloat(getComputedStyle(source).lineHeight) || 24
-  const firstLine = Math.round(source.scrollTop / lineHeight)
+  const atBottom = source.scrollTop + source.clientHeight >= source.scrollHeight - 2
+  if (atBottom) return outlineItems.length - 1
+  const threshold = Math.min(96, source.clientHeight * 0.2)
+  const tops = getSourceOutlineTops(source)
   let index = -1
-  for (let i = 0; i < outlineItems.length; i += 1) {
-    if ((outlineItems[i].line ?? 0) > firstLine + 1) break
+  for (let i = 0; i < tops.length; i += 1) {
+    if (tops[i] - source.scrollTop > threshold) break
     index = i
   }
   return index
-}
-
-// Source mode cannot render a heading band; selecting the heading line gives
-// the same "you have arrived" feedback as the visual flash (#64).
-function revealSourceHeading(source: HTMLTextAreaElement, line: number): void {
-  let start = 0
-  for (let i = 0; i < line; i += 1) {
-    const next = source.value.indexOf('\n', start)
-    if (next === -1) {
-      start = source.value.length
-      break
-    }
-    start = next + 1
-  }
-  const end = source.value.indexOf('\n', start)
-  source.setSelectionRange(start, end === -1 ? source.value.length : end)
 }
 
 function scheduleOutlineUpdate(): void {
@@ -1652,6 +1653,88 @@ function renderFileList(files: import('../preload/index').SiblingFile[]): void {
   }
 }
 
+function showRenameDialog(path: string): void {
+  if (document.querySelector('.rename-dialog')) return
+  const dialog = document.createElement('dialog')
+  dialog.className = 'rename-dialog'
+  const form = document.createElement('form')
+  const label = document.createElement('label')
+  label.textContent = isChinese() ? '重命名文件' : 'Rename file'
+  label.htmlFor = 'rename-file-name'
+  const input = document.createElement('input')
+  input.id = 'rename-file-name'
+  input.type = 'text'
+  input.value = path.split(/[\\/]/).pop() ?? ''
+  input.required = true
+  input.autocomplete = 'off'
+  input.spellcheck = false
+  const error = document.createElement('p')
+  error.className = 'rename-error'
+  error.setAttribute('role', 'alert')
+  const actions = document.createElement('div')
+  actions.className = 'rename-actions'
+  const cancel = document.createElement('button')
+  cancel.type = 'button'
+  cancel.textContent = isChinese() ? '取消' : 'Cancel'
+  const submit = document.createElement('button')
+  submit.type = 'submit'
+  submit.textContent = isChinese() ? '重命名' : 'Rename'
+  actions.append(cancel, submit)
+  form.append(label, input, error, actions)
+  dialog.append(form)
+  document.body.append(dialog)
+  dialog.setAttribute('aria-labelledby', 'rename-file-label')
+  label.id = 'rename-file-label'
+  dialog.addEventListener('close', () => dialog.remove())
+  cancel.addEventListener('click', () => dialog.close())
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault()
+    if (submit.disabled) return
+    submit.disabled = true
+    input.readOnly = true
+    cancel.disabled = true
+    let failure = ''
+    try {
+      await saveQueue
+      if (path === currentFilePath && dirty && !await saveCurrent()) {
+        error.textContent = isChinese() ? '请先处理当前文档的保存问题。' : 'Please resolve the pending save first.'
+        return
+      }
+      await enqueueSave(async () => {
+        const result = await window.electronAPI.renameFile(path, input.value)
+        failure = result.error ?? ''
+        return result.path ?? null
+      })
+      if (!failure) {
+        dialog.close()
+        return
+      }
+      error.textContent = failure === 'EEXIST'
+        ? (isChinese() ? '已有同名文件，请换一个名称。' : 'A file with this name already exists.')
+        : failure === 'EINVAL'
+          ? (isChinese() ? '文件名不能包含路径或特殊字符，请保留原扩展名。' : 'Use a valid filename and keep the original extension.')
+          : failure === 'ENOENT'
+            ? (isChinese() ? '文件已被移动或删除，请刷新后重试。' : 'The file was moved or deleted. Refresh and try again.')
+            : (isChinese() ? '无法重命名，请检查文件权限及所在磁盘是否支持此操作。' : 'Cannot rename. Check file permissions and filesystem support.')
+    } catch {
+      error.textContent = isChinese() ? '重命名失败，原文件已保留。' : 'Rename failed. The original file was preserved.'
+    } finally {
+      submit.disabled = false
+      input.readOnly = false
+      cancel.disabled = false
+      if (dialog.isConnected) input.focus()
+    }
+  })
+  // Escape may cancel before a write starts, but never dismiss an operation
+  // already being committed by the main process.
+  dialog.addEventListener('cancel', (event) => { if (submit.disabled) event.preventDefault() })
+  hideTip()
+  dialog.showModal()
+  input.focus()
+  const dot = input.value.lastIndexOf('.')
+  input.setSelectionRange(0, dot > 0 ? dot : input.value.length)
+}
+
 async function refreshSiblings(): Promise<void> {
   const files = await window.electronAPI.listSiblings()
   if (files) renderFileList(files)
@@ -1789,6 +1872,7 @@ function getExportSnapshot(content: string): {
   styles: string
   bodyClass: string
   background: string
+  tableLayout: string
 } {
   let styles = ''
   for (const sheet of Array.from(document.styleSheets)) {
@@ -1806,6 +1890,7 @@ function getExportSnapshot(content: string): {
     // 图片与 PDF 导出要的是「和屏幕上一模一样」，所以仍旧交编辑器那份 DOM；
     // HTML 导出交的是**一篇文档**：语义标签，没有编辑器自己的类名和行结构。
     html: editorRoot?.innerHTML ?? '',
+    tableLayout: editorRoot?.dataset.tableLayout ?? '',
     document: editorRoot ? documentHTMLFrom(editorRoot) : '',
     styles,
     bodyClass: Array.from(document.body.classList)
@@ -1816,7 +1901,7 @@ function getExportSnapshot(content: string): {
 }
 
 async function exportCurrentHTML(): Promise<void> {
-  finishTableCellEdit()
+  finishEditorComposition()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
@@ -1841,7 +1926,7 @@ async function exportCurrentHTML(): Promise<void> {
 }
 
 async function exportCurrentImage(preset: 'desktop' | 'mobile', destination: ImageExportDestination): Promise<void> {
-  finishTableCellEdit()
+  finishEditorComposition()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
@@ -1875,7 +1960,7 @@ async function exportCurrentImage(preset: 'desktop' | 'mobile', destination: Ima
 // first, or the export would print whatever was on screen before it was typed.
 window.__colamdSlidesExport = {
   enter: async () => {
-    finishTableCellEdit()
+    finishEditorComposition()
     if (sourceModeActive) {
       const content = getContent()
       exitSourceMode()
@@ -1905,7 +1990,7 @@ window.__colamdExportDocumentHTML = (): string => {
 
 window.__colamdPrintExport = {
   enter: async (pageWidths?: PdfPageWidths) => {
-    finishTableCellEdit()
+    finishEditorComposition()
     if (sourceModeActive) setMarkdownProgrammatically(sourceEl().value)
     const view = getEditorView()
     if (pageWidths && view && !forceParsing(view, view.state.doc.length, 5000)) {
@@ -1930,7 +2015,7 @@ async function toggleSlideshow(): Promise<void> {
     stopSlideshow()
     return
   }
-  finishTableCellEdit()
+  finishEditorComposition()
   const wasSourceMode = sourceModeActive
   const sourceScrollRatio = wasSourceMode ? scrollRatio(sourceEl()) : 0
   const content = getContent()
@@ -1977,6 +2062,9 @@ async function init(): Promise<void> {
   const language = await api.getLanguage()
   fileManagerName = await api.getFileManagerName()
   setUiLanguage(language)
+  // 主题和字体设置只换 body 上的类和样式，编辑器察觉不到字宽变了，要外壳告诉它
+  onThemeChange(remeasureEditor)
+  onEditorFontChange(remeasureEditor)
   const savedTheme = loadSavedTheme()
   if (savedTheme.startsWith('custom:')) {
     // Load before applying: a newly opened window must not briefly paint the
@@ -2038,7 +2126,7 @@ async function init(): Promise<void> {
 
   // Main asks for an authoritative snapshot before any close or quit.
   api.onRequestDocumentState(async (requestId) => {
-    captureActiveTab()
+    captureActiveTab(true)
     // Report every tab that still has unsaved content. The main process writes
     // the ones with a path and refuses to close on the untitled ones, so a
     // background tab can never be dropped silently.
@@ -2106,16 +2194,15 @@ async function init(): Promise<void> {
     const target = event.target as HTMLElement | null
     const href = target?.closest('a')?.getAttribute('href') ?? ''
     const input = sourceModeActive ? sourceEl() : null
-    const cellSelection = target?.closest('.cm-md-table-cell-input') ? tableCellEditSelection() : null
     const selection = input
       ? input.value.slice(input.selectionStart, input.selectionEnd)
-      : (cellSelection ?? window.getSelection()?.toString() ?? '')
+      : (window.getSelection()?.toString() ?? '')
     void window.electronAPI.showEditorContextMenu({
       selection,
       link: /^https?:/i.test(href) ? href : null,
       image: target instanceof HTMLImageElement ? target.src : null,
       // 阅读态不回传全选：那边全选选中的是文档源码区间，画出来跟看到的内容对不上
-      canSelectAll: !input && cellSelection === null && !readingModeActive,
+      canSelectAll: !input && !readingModeActive,
     })
   })
   api.onToggleSourceMode(() => toggleSourceMode())
@@ -2152,6 +2239,21 @@ async function init(): Promise<void> {
   // by sections passed along the way (review on #68).
   onEditorJumpPhase((phase) => (phase === 'start' ? beginOutlineJump() : endOutlineJump()))
 
+  api.onRequestRenameFile(showRenameDialog)
+  api.onFileRenamed(({ oldPath, newPath, fileUrl }) => {
+    for (const tab of tabs) {
+      if (tab.filePath === oldPath) tab.filePath = newPath
+    }
+    if (currentFilePath === oldPath) {
+      currentFilePath = newPath
+      applyDocumentFileUrl(fileUrl)
+      updateFileTitle()
+      if (dirty) scheduleAutosave()
+    }
+    panelChildren.clear()
+    renderTabBar()
+    void refreshSiblings()
+  })
   api.onSiblingsChanged((files) => {
     // A watcher refresh can change any directory that is open, so drop the
     // cached levels and let the expanded ones read themselves again.
@@ -2175,7 +2277,7 @@ async function init(): Promise<void> {
     // Diagrams are drawn again for the page rather than reused from the screen
     // (src/renderer/editor/mermaid-export.ts), so this awaits a render per
     // diagram before the save dialog opens.
-    finishTableCellEdit()
+    finishEditorComposition()
     const payload = await markdownForWord(getContent(), currentFilePath)
     await api.exportDOCX(payload)
   }))
@@ -2218,7 +2320,7 @@ async function init(): Promise<void> {
     renderTabBar()
   })
   api.onFileChanged((content) => {
-    finishTableCellEdit()
+    finishEditorComposition()
     if (dirty) {
       raiseExternalConflict()
       return

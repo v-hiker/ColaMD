@@ -80,43 +80,6 @@ async function unitChecks() {
   await context.openFileInNewTab(join(WORK, 'other.md'))
   check('failed save preserves current tab', () => { assert.equal(current.filePath, source); assert.equal(opens, 0) })
 
-  // The rendered cell map also applies to indented and unbordered table rows.
-  const tableCode = readFileSync(join(ROOT, 'src/renderer/editor/table-source.ts'), 'utf8')
-  const { code: compiledTableCell } = await transform(tableCode, { loader: 'ts', format: 'cjs' })
-  const tableModule = { exports: {} }
-  vm.runInNewContext(compiledTableCell, { module: tableModule })
-  const { readTableRow, tableCellChange } = tableModule.exports
-  check('table cell ranges preserve padding', () => {
-    const { cells } = readTableRow('| A | B |')
-    assert.equal(cells[0].from, 2)
-    assert.equal(cells[1].from, 6)
-    assert.equal(cells[1].to, 7)
-  })
-  check('table cell ranges account for indentation and escaped pipes', () => {
-    const { cells } = readTableRow('  | A\\|X | B |')
-    assert.equal(cells.length, 2)
-    assert.equal(cells[0].from, 4)
-    assert.equal(cells[1].text, 'B')
-  })
-  check('clearing an unbordered edge cell retains its column', () => {
-    const source = 'A | B'
-    const row = readTableRow(source)
-    const change = tableCellChange({ row, cell: row.cells[0], column: 0 }, '', pos => source[pos])
-    assert.equal(source.slice(0, change.from) + change.insert + source.slice(change.to), '|  | B')
-  })
-  check('block-looking cell text remains inside the table', () => {
-    const source = 'A | B'
-    const row = readTableRow(source)
-    const change = tableCellChange({ row, cell: row.cells[0], column: 0 }, '# heading', pos => source[pos])
-    assert.equal(source.slice(0, change.from) + change.insert + source.slice(change.to), '| # heading | B')
-  })
-  check('a missing cell takes its own column and keeps embedded line breaks', () => {
-    const source = '| A |'
-    const row = readTableRow(source)
-    const change = tableCellChange({ row, cell: undefined, column: 2 }, 'B | C\nD', pos => source[pos])
-    assert.equal(source.slice(0, change.from) + change.insert + source.slice(change.to), '| A |  | B \\| C<br>D |')
-  })
-
   // Verify renderCode (strips closing fence without leaking backticks)
   const cleanHtmlCode = readFileSync(join(ROOT, 'src/renderer/editor/clean-html.ts'), 'utf8')
   const rStart = cleanHtmlCode.indexOf('function isCodeFenceStart(')
@@ -216,16 +179,23 @@ async function runtimeChecks() {
     await wait(`document.title==='source.md' && !!document.querySelector('[data-href]')`, 'source loaded')
     const openSource = async () => {
       await evaluate(`window.electronAPI.openExternal(${JSON.stringify(source)})`)
-      await wait(`document.title==='source.md'`, 'return to source')
-      await sleep(150)
+      await wait(`document.title==='source.md' && document.querySelector('#editor .cm-content')?.cmTile?.root?.view.state.doc.toString()===${JSON.stringify(sourceText)}`, 'return to source document')
     }
     const click = async (label, modifiers = MOD) => {
-      const point = await evaluate(`(() => {
-        const a=[...document.querySelectorAll('#editor [data-href], #editor a[href]')].find(a=>a.textContent===${JSON.stringify(label)});
-        if(!a)return null; a.scrollIntoView({block:'center',behavior:'instant'});
-        const r=[...a.getClientRects()].find(r=>r.width>2&&r.height>2);
-        return r?{x:r.x+r.width/2,y:r.y+r.height/2}:null;
-      })()`)
+      let point
+      // 标题更新和视口装饰并非同一时刻；先把真实文档里的目标滚入视口，再等可点击矩形。
+      for (let i = 0; i < 80 && !point; i++) {
+        point = await evaluate(`(() => {
+          const view=document.querySelector('#editor .cm-content')?.cmTile?.root?.view;
+          const at=view?.state.doc.toString().indexOf('['+${JSON.stringify(label)}+']');
+          if(at>=0) { view.dispatch({selection:{anchor:at},scrollIntoView:true});view.coordsAtPos(at); }
+          const a=[...document.querySelectorAll('#editor [data-href], #editor a[href]')].find(a=>a.textContent===${JSON.stringify(label)});
+          if(!a)return null; a.scrollIntoView({block:'center',behavior:'instant'});
+          const r=[...a.getClientRects()].find(r=>r.width>2&&r.height>2);
+          return r?{x:r.x+r.width/2,y:r.y+r.height/2}:null;
+        })()`)
+        if (!point) await sleep(100)
+      }
       assert(point, `Link not rendered: ${label}`)
       for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1, modifiers })
     }

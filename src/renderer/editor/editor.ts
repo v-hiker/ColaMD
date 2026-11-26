@@ -12,6 +12,7 @@
 import { type EditorState, type SelectionRange } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { createEditorCore, getEditorHandle, type EditorHandle } from './core'
+import { finishTableComposition } from './table-editing'
 import { footnoteDefinitions } from './footnotes'
 import { selectionHTMLFrom } from './clean-html'
 import { renderWholeDocument, restoreViewport } from '../print-layout'
@@ -22,7 +23,7 @@ import { runFormatCommand as runFormat, type FormatCommandId } from './format-co
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
-import { editedCellSelection, finishCellEdit, installTableCellEditing } from './table-cell-edit'
+import { copiedMarkdown, enclosingForHTML, richCopyFrom } from './copy-markdown'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -264,8 +265,6 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
     })
   })
 
-  installTableCellEditing(root, view)
-
   // 点一下被替换掉的块（公式、图片、图、HTML），把光标放进它的源码里就地改。
   //
   // 曾经只有公式有这么一条路，而且点一下会弹一个编辑框，框里还得再填一次公式（而且填的
@@ -273,7 +272,6 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
   // #138 报上来：换内核之后表格、图、图片都点不进去了，而 2.6 是可以改的。
   // 现在每个替换块都带着自己的源码区间（见 live-preview 的 withSourceRange），
   // 一个处理器管全部；块级 widget 的光标落点有 isBlockActive 兜着，光标进去就露源码。
-  // 表格通过自己的原位编辑器处理点击。普通点击链接时保持编辑焦点。
   root.addEventListener('click', (e) => {
     if (tableWidgetOf(e.target)) {
       if (!view.state.readOnly && e.target instanceof Element && e.target.closest('a')) e.preventDefault()
@@ -282,6 +280,8 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
     // 图上的缩放控件、以及放大态下的图，都是控件自己的地盘：点一下就把光标送进源码，
     // 图当场没了，正在看的局部也就白缩了（控件由 mermaid-bridge 的 attachDiagramZoom 装）。
     const hit = e.target as HTMLElement
+    // 行内公式由 live-preview 的导航入口处理，不能再用通用块落点覆盖选区。
+    if (hit.closest('.cm-md-math-inline[data-source-from]')) return
     if (hit.closest('.pele-zoom')) return
     const diagram = hit.closest('.cm-md-mermaid') as HTMLElement | null
     if (diagram && isDiagramZoomed(diagram)) return
@@ -354,8 +354,9 @@ function selectionRendered(view: EditorView): boolean {
 
 /** 选区对应的 DOM 区间。位置从文档坐标换算，所以只要那些行在 DOM 里就能取到。 */
 function selectionRange(view: EditorView, ranges: readonly SelectionRange[]): Range {
-  const start = view.domAtPos(ranges[0].from)
-  const end = view.domAtPos(ranges[ranges.length - 1].to)
+  const to = ranges[ranges.length - 1].to
+  const start = view.domAtPos(richCopyFrom(view.state, ranges[0].from, to))
+  const end = view.domAtPos(to)
   const range = document.createRange()
   range.setStart(start.node, start.offset)
   range.setEnd(end.node, end.offset)
@@ -373,7 +374,40 @@ function selectionRange(view: EditorView, ranges: readonly SelectionRange[]): Ra
 const MAX_RICH_COPY_CHARS = 200_000
 
 function selectionHTML(view: EditorView, ranges: readonly SelectionRange[]): string {
-  return selectionHTMLFrom(selectionRange(view, ranges).cloneContents())
+  const range = selectionRange(view, ranges)
+  const fragment = range.cloneContents()
+  const inside = enclosingForHTML(view.state, ranges[0].from, ranges[ranges.length - 1].to)
+  let content: Node = fragment
+  // 选区整个落在一段格式文字里（只选了加粗的一半）：cloneContents 只给出字，
+  // 外面那几层格式要补回来，和原文口味补上的 `**` 一致。
+  let node: Node | null = range.commonAncestorContainer
+  if (node.nodeType === Node.TEXT_NODE) node = node.parentNode
+  while (node instanceof HTMLElement && !node.classList.contains('cm-line') && view.contentDOM.contains(node) && node !== view.contentDOM) {
+    const shell = node.cloneNode(false)
+    shell.appendChild(content)
+    content = shell
+    node = node.parentNode
+  }
+  // 分隔换行可能被装饰隐藏：源码选区已跨出标题，DOM 区间却仍在标题行里。
+  // 只恢复缺失的标题外壳，文字仍取选中片段；其它行不因此变成块级复制。
+  if (!inside.heading && node instanceof HTMLElement &&
+      Array.from(node.classList).some(name => /^cm-md-atxheading[1-6]$/.test(name)) && content.textContent?.trim()) {
+    const shell = node.cloneNode(false)
+    shell.appendChild(content)
+    content = shell
+  }
+  const wrapped = document.createDocumentFragment()
+  wrapped.appendChild(content)
+  // 整段选区都在里面的引用、列表项、标题不带出来，和原文口味一致（见 copy-markdown.ts）。
+  // 在补完外壳之后统一处理，避免刚补的外壳又带回不该保留的外层类型。
+  for (const line of wrapped.querySelectorAll<HTMLElement>('.cm-line')) {
+    if (inside.quote) line.classList.remove('cm-md-blockquote')
+    for (const depth of inside.listDepths) {
+      if (line.classList.contains(`cm-md-li-${depth}`)) line.classList.remove('cm-md-li', `cm-md-li-${depth}`, 'cm-md-li-start', 'cm-md-li-ordered')
+    }
+    if (inside.heading) for (let level = 1; level <= 6; level++) line.classList.remove(`cm-md-atxheading${level}`)
+  }
+  return selectionHTMLFrom(wrapped)
 }
 
 /**
@@ -428,19 +462,18 @@ function setupRichCopy(root: HTMLElement): void {
     if (!event.clipboardData || !selection || selection.isCollapsed) return
     const table = tableWidgetOf(selection.anchorNode?.parentElement ?? null)
     if (!table || !root.contains(table) || !root.contains(selection.focusNode)) return
-    event.clipboardData.setData('text/plain', selection.toString())
+    event.clipboardData.setData('text/plain', selection.toString().replace(/ *\t */g, '\t'))
     event.preventDefault()
     event.stopPropagation()
   }, true)
   root.addEventListener('copy', (event) => {
     if (!(event instanceof ClipboardEvent) || event.target instanceof HTMLTextAreaElement) return
-    if (event.target instanceof Element && event.target.closest('.cm-md-table-cell-input')) return
     const view = getEditorView()
     if (!view) return
     // 没选中东西时不动：CodeMirror 那时复制的是整行，那是它更懂的行为。
     const ranges = view.state.selection.ranges.filter((range) => !range.empty)
     if (ranges.length === 0) return
-    const text = ranges.map((range) => view.state.sliceDoc(range.from, range.to)).join('\n')
+    const text = ranges.map((range) => copiedMarkdown(view.state, range)).join('\n')
     event.clipboardData?.setData('text/plain', text)
     if (selectionRendered(view)) {
       const html = selectionHTML(view, ranges)
@@ -555,7 +588,7 @@ function setupFootnotePreview(root: HTMLElement): void {
 }
 
 // 任务列表源码里的一段（含引用里的任务列表）：`- [ ] 文案` 或 `> - [x] 文案`。
-const TASK_RE = /^((?:[ \t]*> ?)*[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[)([ xX])(\])/
+const TASK_RE = /^((?:[ \t]*> ?)*[ \t]*(?:[-*+]|\d+[.)]) +\[)([ xX])(\])/
 
 /** 从点击位置找回任务项那一行；不是任务项就返回 null。 */
 function sourceFromTaskClick(view: EditorView, e: MouseEvent): number | null {
@@ -597,6 +630,11 @@ export function getEditorView(): EditorView | null {
   return handle?.getView() ?? null
 }
 
+/** 换主题后调用：主题只换了 body 上的类，CodeMirror 自己察觉不到字体变了。 */
+export function remeasureEditor(): void {
+  handle?.remeasure()
+}
+
 /**
  * 编辑器的滚动容器。
  *
@@ -618,37 +656,22 @@ export function focusEditor(): void {
 // 放映幻灯片时把编辑器冻住。按键在到达编辑器之前就已经被拦住了
 // （renderer/slideshow.ts）；这是第二道锁，万一有键漏过来，也落不到没人看得见的页面上。
 export function setEditorEditable(editable: boolean): void {
-  if (!editable) finishTableCellEdit()
+  if (!editable) finishEditorComposition()
   handle?.setEditable(editable)
 }
 
-/** Confirm pending cell text before a command reads or locks the document. */
-export function finishTableCellEdit(): number | null {
-  const view = getEditorView()
-  return view ? finishCellEdit(view)?.position ?? null : null
+// 保存、切换模式与导出前由表格扩展结束组字。
+export function finishEditorComposition(): void {
+  const view = handle?.getView()
+  if (view) finishTableComposition(view)
 }
 
-export function tableCellEditSelection(): string | null {
-  const view = getEditorView()
-  return view ? editedCellSelection(view) : null
-}
-
-// 图片灯箱：右键菜单的「查看原图」走主进程绕一圈回来，需要在这里露一个入口。
 export { openImageOverlay }
 
-/**
- * 阅读模式：锁住输入 + 块级 widget 不再因为光标落进去而退回源码。
- *
- * 两个动作必须一起做。只锁编辑，表格点一下照样变成一排竖线；只改装饰层，
- * 还能往里打字，那就不叫阅读。
- *
- * 退出时把可编辑性交还给调用方（外壳知道当前该不该可编辑，比如幻灯片放映时它自己也是锁着的），
- * 所以这里只负责恢复成「可编辑」，放映态的锁由 slideshow 自己再关一次。
- */
 export function setReadingMode(active: boolean): void {
   const view = handle?.getView()
   if (!view) return
-  if (active) finishCellEdit(view)
+  if (active) finishEditorComposition()
   view.dispatch({ effects: setReadingModeEffect.of(active) })
   handle?.setEditable(!active)
 }
@@ -701,7 +724,7 @@ export function setDocumentFileUrl(url: string | null): void {
 export function setCleanExport(on: boolean): void {
   const view = handle?.getView()
   if (!view) return
-  if (on) finishCellEdit(view)
+  if (on) finishEditorComposition()
   view.dispatch({ effects: setCleanExportEffect.of(on) })
 }
 
